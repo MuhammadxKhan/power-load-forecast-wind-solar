@@ -3,11 +3,10 @@ Self-checks on synthetic data. No download, no network.
 
     python selfcheck.py
 
-The numbers these print are meaningless - the data is fake. What matters is
-that the assertions hold: nothing reaches forward in time, the calendar features
-are on German clocks, weather behaves the way the chosen mode says it does, the
-MLP's scalers never see the test period, and every model is scored on the same
-rows.
+The printed numbers are meaningless - the data is fake. What matters is that the
+assertions hold: nothing reaches forward in time, calendars are on German
+clocks, each weather mode does what it claims, the MLP's scalers never see the
+test period, and every model is scored on the same rows.
 """
 
 import numpy as np
@@ -36,10 +35,8 @@ def _changed_rows(before, after):
 
 
 def check_no_load_leakage(load):
-    # 1) no feature may react to a load change less than 24h before it.
-    # Note the >= t: a feature that used the value AT t would be the worst leak
-    # of all, and the old version of this test let it through by only looking
-    # strictly after t.
+    # 1) no feature may react to a load change less than 24h before it. Note
+    # the >= t: a feature reading the value AT t would be the worst leak of all.
     Xb, _ = build_features(load)
     poked, t = _poke(load, 3000, 50000)
     Xa, _ = build_features(poked)
@@ -103,15 +100,9 @@ def check_beats_naive(frame):
 def check_weather_modes(load):
     """6) each weather mode does what it claims, and 'lagged' cannot leak.
 
-    This is the check that keeps the weather honest. Poke the temperature series
-    and see which modes react.
-
-      lagged   must NOT react inside 24h - it only ever looks backwards
-      perfect  MUST react at the poked hour, because that is the whole point of
-               perfect prognosis, and if it didn't the mode would be broken
-
-    Asserting both ways round means the modes can't quietly become the same
-    thing.
+    Poke the temperature series and see which modes react. 'lagged' must not
+    react inside 24h; 'perfect' must react at the poked hour. Asserting both
+    directions stops the two modes quietly collapsing into each other.
     """
     temp = fake_temperature(load.index, seed=3)
 
@@ -150,24 +141,18 @@ def check_weather_modes(load):
 def check_netcdf_reader():
     """7) the ERA5 NetCDF reader actually reads NetCDF.
 
-    Everything else here uses fake_temperature, which is a plain pandas Series -
-    so none of it exercises xarray at all. This builds a real two-file NetCDF
-    fixture in ERA5's layout, reads it through the same _from_netcdf the real
-    pipeline uses, and deletes it. Two files specifically, because the earlier
-    version of _from_netcdf called xarray.open_mfdataset, which needs dask, and
-    dask was never a dependency - so the multi-year path (src/download_era5.py
-    writes one file per year) would have died with an ImportError the first time
-    it met real data. The single-file path worked, which is exactly why nobody
-    noticed.
+    Everything else here runs on a plain pandas Series and never touches xarray.
+    This builds a real two-file fixture in ERA5's layout, reads it through the
+    same _from_netcdf the pipeline uses, and deletes it. Two files because the
+    downloader writes one per year, and the multi-file path is the one that
+    breaks.
     """
     try:
         import xarray as xr
     except ImportError:
         raise AssertionError(
             "xarray is a pinned dependency but isn't installed, so the NetCDF "
-            "reader is untested. Install it rather than skipping - an earlier "
-            "version printed 'skipping' and then 'All checks passed', which is "
-            "worse than failing.")
+            "reader is untested. Failing is better than skipping quietly.")
 
     import shutil
     import tempfile
@@ -179,8 +164,7 @@ def check_netcdf_reader():
             idx = pd.date_range(f"{yr}-01-01", periods=36, freq="h")
             lats = np.arange(55.0, 53.9, -0.25)
             lons = np.arange(5.5, 6.6, 0.25)
-            # a known field so the spatial mean is predictable: every cell in
-            # hour i holds exactly 273.15 + i + k, so the mean is i + k in C
+            # every cell in hour i holds 273.15 + i + k, so the mean is i + k in C
             base = np.arange(len(idx), dtype="float32") + k + 273.15
             data = np.repeat(np.repeat(base[:, None, None], len(lats), 1), len(lons), 2)
             f = f"{tmp}/era5_t2m_{yr}.nc"
@@ -203,12 +187,12 @@ def check_netcdf_reader():
 
 
 def check_mlp_scalers_and_determinism(load):
-    """7) the MLP's scalers only ever see the fold it is fitted on.
+    """8) the MLP's scalers only ever see the fold it is fitted on.
 
-    The fit functions are never handed the test set, so structurally they can't scale by
-    test statistics. Asserting that is weak on its own, so this does it the hard
-    way: wreck the load series inside the test period, refit everything, and
-    check the model that comes out is bit-for-bit the one from the clean run.
+    The fit functions are never handed the test set, so structurally they cannot
+    scale by test statistics. This checks it the hard way: wreck the load series
+    inside the test period, refit, and require the model that comes out to be
+    bit-for-bit the one from the clean run.
     """
     X, y = build_features(load)
     (Xtr, ytr), (Xva, yva), (Xte, yte) = chronological_split(X, y, VAL_START, TEST_START)
@@ -243,8 +227,7 @@ def check_mlp_scalers_and_determinism(load):
 
 
 def check_same_rows(frame):
-    """8) every model and baseline scored on identical rows. This is what makes
-    the comparison mean anything."""
+    """9) every model and baseline scored on identical rows."""
     load = frame["load_mw"]
     X, y = build_features(load)
     (Xtr, ytr), (Xva, yva), (Xte, yte) = chronological_split(X, y, VAL_START, TEST_START)

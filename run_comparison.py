@@ -11,11 +11,9 @@ seasonal-naive baseline and a published ENTSO-E-derived day-ahead benchmark.
     python run_comparison.py --weather noisy --seed 7   # a different noise draw
     python selfcheck.py                             # checks, no download
 
-Identical ground means the features and the split come from src/features.py, so
-every model sees the same columns and rows; every model runs the same protocol
-(small grid on validation, one refit on train+val, one score on test); and every
-model is scored by the same code in src/evaluate.py on the same index, which is
-asserted rather than assumed.
+Identical ground: features and split come from src/features.py, every model runs
+the same protocol (small grid on validation, one refit on train+val, one score
+on test), and src/evaluate.py scores them all on an index it asserts is shared.
 """
 
 import argparse
@@ -48,9 +46,8 @@ def main():
                    help="rolling-origin folds as well as the single split (slow)")
     p.add_argument("--no-plots", action="store_true")
     p.add_argument("--seed", type=int, default=0,
-                   help="seed for the synthetic error in --weather noisy. The "
-                        "reported effect moves by more than the effect itself, "
-                        "so sweep it rather than trusting one run.")
+                   help="noise draw for --weather noisy; sweep it rather than "
+                        "trusting one run")
     args = p.parse_args()
 
     os.makedirs(RESULTS, exist_ok=True)
@@ -98,19 +95,17 @@ def main():
         off, bm = mae(yte, preds["entsoe_benchmark"]), mae(yte, preds[best])
         print(f"vs the published ENTSO-E-derived benchmark: {bm:,.0f} vs "
               f"{off:,.0f} MW MAE")
-        print("  NOT a like-for-like comparison. The benchmark is published at "
-              "least two hours\n  before day-ahead gate closure (~10:00 on D-1 "
-              "for Germany); this model assumes\n  midnight, so it has ~14 hours "
-              "more demand data. Lower MAE here does not mean\n  a better "
-              "forecast. See the README.")
+        print("  Not like-for-like: the benchmark is published around 10:00 on "
+              "D-1, so this\n  model has ~14 hours more demand data. A lower MAE "
+              "here is not a better forecast.")
 
     gbm_mae, mlp_mae = mae(yte, preds["gbm"]), mae(yte, preds["mlp"])
     gap = abs(gbm_mae - mlp_mae)
     print(f"\nGBM vs MLP: {gbm_mae:,.0f} vs {mlp_mae:,.0f} MW "
           f"({gap / min(gbm_mae, mlp_mae):.1%} apart)")
     if gap / min(gbm_mae, mlp_mae) < 0.02:
-        print("  Under 2% on one test window - treat that as a tie, not a winner."
-              "\n  Run with --backtest to see whether the ordering is even stable.")
+        print("  Under 2% on one window - a tie. Use --backtest to see whether "
+              "the ordering holds.")
 
     print("\nMAE by local target hour, MW (NOT lead time - see evaluate.py):")
     lead = mae_by_target_hour(yte, preds)
@@ -155,12 +150,8 @@ def _save(fig, name):
 
 
 def plot_actual_vs_forecast(y, preds, days=7, start=None):
-    """One week of actual demand with the forecasts on top.
-
-    The table says the GBM is off by ~1,200 MW on average. This says what that
-    looks like: whether it's tracking the shape and sitting slightly off, or
-    missing the peaks, which are very different problems.
-    """
+    """One week of actual demand with the forecasts on top - whether the model
+    tracks the shape and sits slightly off, or misses the peaks."""
     idx = y.index.tz_convert(TZ)
     start = pd.Timestamp(start, tz=TZ) if start else idx[0]
     m = (idx >= start) & (idx < start + pd.Timedelta(days=days))
@@ -178,12 +169,9 @@ def plot_actual_vs_forecast(y, preds, days=7, start=None):
 
 
 def plot_error_by_target_hour(y, preds):
-    """MAE against the target's local clock hour.
-
-    Not lead time - with one midnight origin the two are the same variable, so
-    this cannot separate horizon decay from "afternoon is hard". It is still
-    worth plotting: it shows which hours cost you the most.
-    """
+    """MAE against the target's local clock hour. Not lead time, with a single
+    midnight origin the two are the same variable - but it shows which hours
+    cost the most."""
     tbl = mae_by_target_hour(y, preds)
     keep = [c for c in ("gbm", "mlp", "ridge", "entsoe_benchmark", "seasonal_naive")
             if c in tbl]
@@ -199,12 +187,8 @@ def plot_error_by_target_hour(y, preds):
 
 
 def plot_load_vs_temperature(y, temp):
-    """Demand against temperature - the reason weather belongs in the model.
-
-    Expect a V: heating demand at the cold end, cooling at the warm end, minimum
-    somewhere in the middle. A straight line cannot fit that shape, which is why
-    the heating/cooling degree-hour features exist.
-    """
+    """Demand against temperature. Expect a V - heating at the cold end, cooling
+    at the warm end - which is why the degree-hour features exist."""
     t = temp.reindex(y.index)
     hour = y.index.tz_convert(TZ).hour
 
@@ -222,8 +206,7 @@ def plot_load_vs_temperature(y, temp):
 
 
 def plot_worst_days(y, preds, n=12):
-    """The days the model got most wrong, ranked. Where the model breaks is
-    usually more informative than where it works."""
+    """The days the model got most wrong, ranked."""
     name = "gbm" if "gbm" in preds else list(preds)[0]
     err = (preds[name] - y).abs()
     daily = err.groupby(y.index.tz_convert(TZ).date).mean().sort_values(ascending=False)
