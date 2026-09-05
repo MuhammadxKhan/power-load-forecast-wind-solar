@@ -263,6 +263,42 @@ def clear_sky_output(index, lat, lon, air_c=None, tilt=PANEL_TILT,
     return out
 
 
+def fleet_clear_sky(index, centroids, shares, air_c=None, tilt=PANEL_TILT,
+                    panel_azimuth=PANEL_AZIMUTH):
+    """Clear-sky output for a fleet spread over several places.
+
+    Solar geometry depends on latitude, so a national figure is built from
+    per-location values rather than from one point. `centroids` maps a name to
+    (lat, lon); `shares` weights them, and generation share is the sensible
+    weight because it is what the fleet actually produces.
+
+    The shift is small but real. The four German control-zone centroids span
+    3.4 degrees of latitude, about 25 minutes of midsummer daylight between the
+    northernmost and the southernmost.
+
+    Air temperature stays national. Latitude is a first-order effect on
+    irradiance and costs nothing to resolve; temperature enters only through a
+    derate of a few percent, so resolving it per zone would not pay for itself.
+    """
+    total = float(sum(shares[k] for k in centroids))
+    if total <= 0:
+        raise ValueError("fleet shares sum to zero")
+
+    out = None
+    for name, (lat, lon) in centroids.items():
+        w = shares[name] / total
+        part = clear_sky_output(index, lat, lon, air_c, tilt, panel_azimuth)
+        cols = [c for c in part.columns if c != "daylight"]
+        scaled = part[cols] * w
+        out = scaled if out is None else out + scaled
+
+    # daylight anywhere in the fleet, not on average
+    out["daylight"] = False
+    for lat, lon in centroids.values():
+        out["daylight"] |= is_daylight(solar_position(index, lat, lon)["zenith"])
+    return out
+
+
 def clear_sky_index(generation, clear_sky, floor=1e-3):
     """Actual over clear-sky: the fraction of a cloudless sky that got through.
 

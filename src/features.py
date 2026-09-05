@@ -130,6 +130,102 @@ def build_features(load, temp=None, weather_mode="none", seed=0):
     return df, y
 
 
+# --------------------------------------------------------------------------
+# solar
+# --------------------------------------------------------------------------
+SOLAR_LAGS = [24, 48, 72, 168]
+SOLAR_WEATHER_MODES = ("none", "clearsky", "lagged", "perfect")
+
+NOCT_RISE = (45.0 - 20.0) / 800.0   # cell temperature rise per W/m2, see solar.py
+GAMMA = -0.004                      # output lost per degree above 25 C
+
+
+def build_solar_features(cf, clear_sky=None, temp=None, weather_mode="clearsky"):
+    """Features for the solar capacity-factor model.
+
+    Same 24-hour rule as demand: nothing touches the generation series at a lag
+    under 24 hours. The modes differ from the demand ones because solar has a
+    component demand does not - where the sun is, is deterministic, so it is
+    available for any future hour with no forecast at all.
+
+      "none"      calendar and lags only
+      "clearsky"  + solar geometry and clear-sky irradiance. Free, in the sense
+                  that it is computable years ahead from latitude, longitude and
+                  the clock.
+      "lagged"    + yesterday's cloudiness, and yesterday's temperature
+      "perfect"   + yesterday's cloudiness, and target-hour temperature
+
+    lagged and perfect differ only in when the temperature is read, so the gap
+    between them is the value of knowing tomorrow's temperature rather than
+    yesterday's - the same question the demand model asks.
+
+    There is no perfect-irradiance mode: bounding the cloud channel needs
+    archived forecast or observed irradiance, and only temperature can be
+    bounded from what is here.
+
+    No weekday feature. Demand drops on a Sunday; the sun does not.
+    """
+    if weather_mode not in SOLAR_WEATHER_MODES:
+        raise ValueError(f"weather_mode must be one of {SOLAR_WEATHER_MODES}")
+    if weather_mode != "none" and clear_sky is None:
+        raise ValueError(f"weather_mode={weather_mode!r} needs a clear-sky frame")
+
+    df = pd.DataFrame({"cf": cf})
+    idx = df.index
+    loc = idx.tz_convert(TZ)
+
+    df["hour"] = loc.hour
+    df["month"] = loc.month
+    df["hour_sin"], df["hour_cos"] = _cyclical(loc.hour.to_numpy(), 24)
+    df["doy_sin"], df["doy_cos"] = _cyclical(loc.dayofyear.to_numpy(), 365)
+
+    for lag in SOLAR_LAGS:
+        df[f"lag_{lag}h"] = df["cf"].shift(lag)
+
+    past = df["cf"].shift(24)
+    df["roll_mean_24h"] = past.rolling(24).mean()
+    df["roll_mean_168h"] = past.rolling(168).mean()
+
+    if weather_mode != "none":
+        cs = clear_sky.reindex(idx)
+        df["cs_poa"] = cs["cs_poa"]
+        df["cs_ghi"] = cs["cs_ghi"]
+        df["elevation"] = cs["elevation"]
+        df["azimuth"] = cs["azimuth"]
+        df["is_daylight"] = cs["daylight"].astype(int)
+
+        if weather_mode in ("lagged", "perfect"):
+            if temp is None:
+                raise ValueError(f"weather_mode={weather_mode!r} needs a temperature series")
+            t = temp.reindex(idx)
+            if weather_mode == "lagged":
+                t = t.shift(24)
+            df["temp_c"] = t
+
+            # panels heat with irradiance as well as with air temperature, and
+            # lose output as they heat
+            cell = t + NOCT_RISE * cs["cs_poa"]
+            df["cell_c"] = cell
+            df["derate"] = 1.0 + GAMMA * (cell - 25.0)
+            df["cs_output"] = cs["cs_poa"] / 1000.0 * df["derate"]
+
+            # Yesterday's cloudiness, as one number for the day rather than hour
+            # by hour: the clear-sky index is undefined at night, and a daily
+            # figure is defined for every hour of the day that follows it.
+            #
+            # Summed over the day, not averaged hour by hour. The hourly ratio is
+            # four times larger at dawn than at noon, so a mean of ratios is
+            # dominated by the hours that produce almost nothing.
+            poa = cs["cs_poa"]
+            df["kt_yesterday"] = (df["cf"].rolling(24).sum()
+                                  / poa.rolling(24).sum().where(lambda s: s > 1.0)
+                                  ).shift(24)
+
+    df = df.dropna()
+    y = df.pop("cf")
+    return df, y
+
+
 def _as_utc(t):
     """Accept "2019-01-01" or an already tz-aware Timestamp; the backtest builds
     its fold boundaries by date arithmetic, so they arrive aware."""
