@@ -101,6 +101,16 @@ than hiding in the table. Once night is gone the remaining signal is close to
 linear in the clear-sky features, which is a shape a shallow booster fits worse
 than a linear model or a small network.
 
+**What is not measured here.** The only exogenous input the solar model gets is
+2m temperature. There is no observed irradiance and no cloud field, so the
+question this repo asks is answered for demand and half answered for solar:
+cloud is the dominant unknown and it is never handed to the model. Operational
+forecasts driven by numerical weather prediction take far more than 5.6% off
+persistence, and the gap is that missing input rather than the models. Closing it
+is one more Copernicus request — `surface_solar_radiation_downwards`, through the
+download path that already exists in `src/download_era5.py` — and a `perfect`
+irradiance mode beside the temperature one.
+
 ![German solar capacity factor under its clear-sky ceiling](results/figures/solar_week.png)
 
 The shaded ceiling is astronomy: solar position, air mass, and an isotropic-sky
