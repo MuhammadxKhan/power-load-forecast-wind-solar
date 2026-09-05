@@ -19,7 +19,8 @@ from src.evaluate import (assert_same_rows, baseline_preds, clearsky_persistence
                           daylight_rows, mae, mae_by_target_hour, predict,
                           seasonal_naive, skill, solar_yesterday)
 from src.features import (build_features, build_solar_features,
-                          chronological_split, degree_hours, usable_temperature)
+                          chronological_split, degree_hours,
+                          solar_history_features, usable_temperature)
 from src.geo import (Grid, area_weights, grid_weights, inside_outline,
                      population_weights)
 from src.models import ALL_MODELS, fit_mlp
@@ -586,6 +587,91 @@ def check_solar_baselines():
           f"daylight keeps {frac:.0%}")
 
 
+def check_solar_history_is_complete():
+    """21) solar_history_features() names every feature built from generation.
+
+    ablations.py drops those columns to model an asset with no production
+    record. If one escapes the list the ablation is contaminated - the "no
+    history" model still gets history, and the number published against it is
+    wrong.
+
+    Rather than compare against a hand-written list, this pokes the generation
+    series and requires that every column which moved is named. That catches a
+    new target-derived feature automatically. It found kt_yesterday, which reads
+    like a weather feature and is named like one, but is computed from
+    yesterday's output.
+    """
+    cf, cs, temp = _fake_solar_inputs()
+    poked, _ = _poke(cf, 3000, 0.4)
+
+    for mode in ("none", "clearsky", "lagged", "perfect"):
+        frame = None if mode == "none" else cs
+        Xb, _ = build_solar_features(cf, frame, temp, mode)
+        Xa, _ = build_solar_features(poked, frame, temp, mode)
+
+        common = Xb.index.intersection(Xa.index)
+        moved = {c for c in Xb.columns
+                 if not Xb.loc[common, c].equals(Xa.loc[common, c])}
+        named = set(solar_history_features(mode)) & set(Xb.columns)
+
+        missed = moved - named
+        assert not missed, \
+            f"mode {mode!r}: {sorted(missed)} react to generation but are not in " \
+            "solar_history_features(), so the no-history ablation would leak them"
+
+        # and the list must not name columns that are actually exogenous, or the
+        # ablation would be throwing away weather it was meant to keep
+        spurious = {c for c in named if c not in moved}
+        assert not spurious, \
+            f"mode {mode!r}: {sorted(spurious)} are named as history but do not " \
+            "react to generation"
+
+        left = [c for c in Xb.columns if c not in named]
+        assert Xb.loc[common, left].equals(Xa.loc[common, left]), \
+            f"mode {mode!r}: dropping the named history still leaves a reacting column"
+    print("  [ok] solar_history_features() names exactly the generation-derived columns")
+
+
+def check_fleet_azimuth_is_circular():
+    """22) the fleet azimuth is a circular mean, not an arithmetic one.
+
+    Azimuth wraps at 360. Averaging 1 degree and 359 degrees arithmetically gives
+    180 - due south - when the answer is due north. It only bites at night, when
+    zones either side of the meridian straddle the wrap, but those hours are in
+    the training set.
+    """
+    # Near the equinox, because that is when it bites. At midsummer every zone's
+    # azimuth wraps through north at the same hour and the two means agree; near
+    # the equinox the wrap happens at different hours east and west, so the
+    # arithmetic mean lands 90 degrees out.
+    idx = pd.date_range("2015-09-30", periods=48, freq="h", tz="UTC")
+    zones = ZONE_CENTROIDS
+    fleet = fleet_clear_sky(idx, zones, {z: 1.0 for z in zones})
+
+    n = len(zones)
+    sin_s = cos_s = 0.0
+    for lat, lon in zones.values():
+        a = np.radians(solar_position(idx, lat, lon)["azimuth"].to_numpy())
+        sin_s = sin_s + np.sin(a) / n
+        cos_s = cos_s + np.cos(a) / n
+    want = np.degrees(np.arctan2(sin_s, cos_s)) % 360.0
+
+    got = fleet["azimuth"].to_numpy()
+    gap = np.abs((got - want + 180) % 360 - 180)
+    assert gap.max() < 1e-9, f"fleet azimuth is not the circular mean, off by {gap.max():.1f} deg"
+
+    # the test has to be able to fail: at least one hour where the arithmetic
+    # mean would give a materially different answer
+    linear = np.zeros(len(idx))
+    for lat, lon in zones.values():
+        linear += solar_position(idx, lat, lon)["azimuth"].to_numpy() / n
+    spread = np.abs((linear - want + 180) % 360 - 180)
+    assert spread.max() > 10.0, \
+        "no hour here distinguishes a circular mean from an arithmetic one"
+    print(f"  [ok] fleet azimuth is a circular mean (arithmetic would be "
+          f"{spread.max():.0f} deg out at worst)")
+
+
 def main():
     print("Self-check on synthetic data (numbers are meaningless)...\n")
     frame = fake_frame(400, seed=1)
@@ -611,6 +697,8 @@ def main():
     check_solar_no_leakage()
     check_solar_modes()
     check_solar_baselines()
+    check_solar_history_is_complete()
+    check_fleet_azimuth_is_circular()
 
     print("\nAll checks passed.")
 
