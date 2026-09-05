@@ -264,6 +264,14 @@ every push.
   each other.
 - **The clear-sky columns must not react at all** to a change in generation. They
   are astronomy and know nothing about what the fleet produced.
+- **Every column that does react is named** by `solar_history_features()`, and
+  every column it names does react. Checked by poking rather than against a
+  hand-written list, because a list has to be maintained and this one had already
+  drifted — which is how `kt_yesterday` leaked into the no-history ablation.
+- **The fleet azimuth is a circular mean**, checked against one computed
+  independently. The check also asserts that an arithmetic mean would have been
+  materially different, because at midsummer it would not be, and a version of
+  this test run on those hours passed while proving nothing.
 - **Solar physics against outside numbers.** Axial tilt 23.44°, equation of time
   −14 to +16 minutes, noon elevation at Berlin on both solstices, solar noon 54
   minutes ahead of noon UTC at 13.4°E. Azimuth is checked at minute resolution,
