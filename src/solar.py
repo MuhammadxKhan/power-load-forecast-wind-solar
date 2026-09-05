@@ -111,9 +111,12 @@ def solar_position(index, lat, lon):
 def is_daylight(zenith, horizon=90.0):
     """True where the sun is above the horizon.
 
-    Solar output is exactly zero for 43% of the hours in the year, and every
-    model predicts those correctly. Scoring them inflates every skill number, so
-    the evaluation drops them.
+    The mask drops about 48% of the hours in the year. Those are not quite the
+    same as the 43% where German output is exactly zero: the fleet is still
+    reporting a few tens of MW in the twilight hours either side of the
+    geometric horizon, against a mean of 4.5 GW. Dropping them is the
+    conservative choice - it discards a little real generation rather than
+    keeping a large block of hours that every model predicts correctly.
     """
     return np.asarray(zenith) < horizon
 
@@ -284,13 +287,24 @@ def fleet_clear_sky(index, centroids, shares, air_c=None, tilt=PANEL_TILT,
     if total <= 0:
         raise ValueError("fleet shares sum to zero")
 
-    out = None
+    out, sin_az, cos_az = None, 0.0, 0.0
     for name, (lat, lon) in centroids.items():
         w = shares[name] / total
         part = clear_sky_output(index, lat, lon, air_c, tilt, panel_azimuth)
-        cols = [c for c in part.columns if c != "daylight"]
+
+        # Azimuth is an angle on a circle, so it cannot be averaged like the
+        # rest. Zones east and west of the meridian straddle 0/360 before dawn,
+        # and a plain mean of 1 degree and 359 degrees is 180 - due south, at
+        # midnight. Average the unit vectors and take the argument instead.
+        a = np.radians(part["azimuth"].to_numpy())
+        sin_az = sin_az + w * np.sin(a)
+        cos_az = cos_az + w * np.cos(a)
+
+        cols = [c for c in part.columns if c not in ("daylight", "azimuth")]
         scaled = part[cols] * w
         out = scaled if out is None else out + scaled
+
+    out["azimuth"] = np.degrees(np.arctan2(sin_az, cos_az)) % 360.0
 
     # daylight anywhere in the fleet, not on average
     out["daylight"] = False
