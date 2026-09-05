@@ -1,23 +1,16 @@
 """
-The three models. Same features, same split, same protocol, same interface.
-
-Each one exposes exactly:
+The three models, on the same features, split and protocol:
 
     fit_ridge / fit_gbm / fit_mlp
         (Xtr, ytr, Xva, yva, Xfit, yfit, verbose) -> (predict_fn, info)
 
 Each runs a four-configuration grid on the validation fold, refits once on
-train+val, and returns something that predicts. One file, so the identical
-signatures are checkable at a glance.
-
-None is ever handed the test set, so none can touch it - structural, not a
-promise. Ridge and the MLP both standardise inputs on whatever fold they are
-fitted on.
+train+val, and returns something that predicts. None is ever handed the test
+set, so none can touch it.
 
 The MLP is deliberately plain: dense, ReLU, Adam, early stopping, fixed seed.
-Its loss is MSE because HistGradientBoostingRegressor minimises squared error;
-different losses would make any gap between them a fact about the loss rather
-than the model.
+Its loss is MSE to match the gradient booster's squared-error objective, so any
+gap between them is about the model rather than the loss.
 """
 
 import numpy as np
@@ -58,13 +51,10 @@ def fit_ridge(Xtr, ytr, Xva, yva, Xfit, yfit, verbose=True):
 # --------------------------------------------------------------------------
 # gradient boosting
 #
-# early_stopping is forced off. The default is "auto", which switches itself ON
-# above 10,000 rows and carves an internal 10% validation slice out of whatever
-# you hand it. With 25,800 training rows that was silently active, so max_iter
-# =600 was really running about 95 iterations and the [300, 600] grid was tuning
-# a number the model ignored. Off means max_iter means max_iter, and the
-# external validation fold is the only one - which is what the README claimed
-# all along.
+# early_stopping is forced off. The default is "auto", which turns itself on
+# above 10,000 rows and carves an internal 10% validation slice out of the
+# training data. Off means max_iter means max_iter, and the external validation
+# fold is the only one.
 # --------------------------------------------------------------------------
 GBM_LEARNING_RATES = [0.05, 0.1]
 MAX_ITERS = [300, 600]
@@ -136,10 +126,9 @@ def _predict(net, xs, ys, X):
 def _train(Xa, ya, hidden, lr, epochs, Xva=None, yva=None, seed=SEED):
     """Fit on (Xa, ya). Both scalers see that fold and nothing else.
 
-    With a validation fold, stop early and report the winning epoch - that count
-    is a hyperparameter like any other. Without one, train for exactly `epochs`,
-    which is how the refit reuses the tuned number. Same shape as the GBM's
-    max_iter: chosen on validation, then held fixed for the refit.
+    With a validation fold, stop early and report the winning epoch; the refit
+    then trains for exactly that many. Same shape as the booster's max_iter,
+    chosen on validation and held fixed for the refit.
     """
     xa = Xa.to_numpy(dtype=np.float64)
     yv = ya.to_numpy(dtype=np.float64).reshape(-1, 1)
@@ -170,8 +159,8 @@ def _train(Xa, ya, hidden, lr, epochs, Xva=None, yva=None, seed=SEED):
         if Xva is None:
             continue
 
-        # early stopping watches val MAE because val MAE picks the winner for
-        # the other two models as well. Training still minimises MSE.
+        # early stopping watches val MAE, which is what picks the winner for the
+        # other two models as well. Training still minimises MSE.
         v = mae(yva, _predict(net, xs, ys, Xva))
         if v < best_val:
             best_val, best_epoch, stale = v, ep, 0
@@ -215,7 +204,6 @@ def fit_mlp(Xtr, ytr, Xva, yva, Xfit, yfit, verbose=True):
     return (lambda X: _predict(net, xs, ys, X)), info
 
 
-# every model in the comparison, in table order. run_comparison.py and
-# selfcheck.py both iterate this, so adding a fourth model means adding it here
-# and nowhere else.
+# every model in the comparison. run_comparison.py and selfcheck.py both iterate
+# this, so a fourth model is added here and nowhere else.
 ALL_MODELS = [fit_ridge, fit_gbm, fit_mlp]

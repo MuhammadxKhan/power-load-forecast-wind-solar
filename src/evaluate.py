@@ -1,19 +1,11 @@
 """
-Baselines, metrics, the scoring table, and the rolling-origin backtest.
+Baselines, metrics, the scoring table, and the rolling-origin backtest. Every
+model is scored by the same code on the same rows.
 
-Everything that turns predictions into numbers lives here, so every model is
-scored by exactly the same code on exactly the same rows.
-
-The baselines now include a real published benchmark. OPSD ships a day-ahead
-load forecast column derived from ENTSO-E Transparency data, in the same file as
-the demand figures. Seasonal naive tells you whether the model learned anything;
-the published benchmark tells you whether the answer is in the right ballpark.
-
-Be careful how that benchmark is described. It is OPSD's aggregation, not a raw
-untouched TSO series, and the file keeps target timestamps but no forecast
-vintage - so there is no way to know whether a value is the first issuance or a
-later revision. Its information cutoff is earlier than this model's assumed
-midnight either way, so beating it is not a like-for-like win.
+Two baselines matter. Seasonal naive says whether the model learned anything;
+the ENTSO-E-derived day-ahead forecast that OPSD ships says whether the answer
+is in the right ballpark. That one is published around 10:00 on D-1, earlier
+than this model's assumed midnight, so beating it is not a like-for-like win.
 """
 
 import numpy as np
@@ -26,13 +18,7 @@ TZ = "Europe/Berlin"
 # baselines
 # --------------------------------------------------------------------------
 def seasonal_naive(load):
-    """Same hour, same weekday, last week. The one to beat first.
-
-    168 rows back is 168 UTC hours, which is the same LOCAL clock hour on every
-    week except the two containing a daylight-saving change - there it lands an
-    hour out. Two weeks a year, left as is because changing it would move the
-    published baseline, but worth knowing it is not exactly "same local hour".
-    """
+    """Same hour, same weekday, last week. The one to beat first."""
     return load.shift(168)
 
 
@@ -59,8 +45,7 @@ def baseline_preds(frame, index):
         bench = frame["benchmark_mw"].reindex(index)
         gaps = int(bench.isna().sum())
         if gaps:
-            # never fabricate benchmark values just to keep a column in the
-            # table - drop it and say why
+            # drop the column rather than invent forecast values nobody published
             print(f"  benchmark has {gaps} missing hours in the scored window "
                   f"({gaps / len(index):.2%}) - excluded from the table")
         else:
@@ -84,9 +69,8 @@ def mape(a, b):
 
 
 def bias(y, pred):
-    """Mean signed error. Positive means the forecast runs high. MAE hides this
-    completely - a forecast can have a fine MAE and still be systematically
-    over, which matters if you're buying generation against it."""
+    """Mean signed error. Positive means the forecast runs high - which MAE
+    hides completely, and which matters if you buy generation against it."""
     return float(np.mean(pred - y))
 
 
@@ -103,9 +87,9 @@ def predict(model, X):
 # scoring
 # --------------------------------------------------------------------------
 def assert_same_rows(y, preds):
-    """Every model and baseline must be scored on the same timestamps, in the
-    same order. If one quietly dropped or reordered rows its MAE is an average
-    over different hours and the table compares nothing."""
+    """Every model and baseline scored on the same timestamps in the same order.
+    A model that quietly dropped rows would average over different hours, and the
+    table would compare nothing."""
     for name, pr in preds.items():
         if len(pr) != len(y):
             raise AssertionError(
@@ -128,12 +112,8 @@ def score_table(y, preds, base="seasonal_naive"):
 def mae_by_target_hour(y, preds):
     """Error against the target's local clock hour.
 
-    NOT lead-time verification, though an earlier version claimed it was. With
-    one midnight origin, clock hour and horizon are the same variable, so "the
-    forecast decays with horizon" and "afternoon load is harder" are
-    indistinguishable. Real lead-time verification needs the same valid time
-    from several issue times. Doubly wrong for entsoe_benchmark, whose issue
-    time is not midnight. What it does show is which hours are hard.
+    Not lead-time verification: with a single midnight origin, clock hour and
+    horizon are the same variable. What it shows is which hours are hard.
     """
     lead = pd.Index(y.index.tz_convert(TZ).hour, name="local_hour")
     return pd.DataFrame({n: pd.Series((pr - y).abs().to_numpy()).groupby(lead).mean()
@@ -149,21 +129,13 @@ def worst_days(y, pred, n=5):
 # --------------------------------------------------------------------------
 # rolling-origin backtest
 #
-# One train/val/test split gives one number per model and no way to tell whether
-# a gap between two of them is real or just which window you happened to pick.
-# That matters here: on the single split the GBM and the MLP finish about 21 MW
-# apart, under 2%.
+# One split gives one number per model and no way to tell a real gap from the
+# window you happened to pick - on the single split the booster and the MLP
+# finish under 2% apart. So walk the origin forward: each fold trains up to its
+# own cutoff, tunes on the year before its test block, and scores the block.
 #
-# So walk the origin forward. Each fold trains on everything up to its own
-# cutoff, tunes on the year before its test block, and scores the block. Same
-# protocol as the main run, four times, on four different test periods.
-#
-# Two things this is NOT. Not a significance test - that's a Diebold-Mariano
-# test on the paired errors, accounting for serial correlation, and it isn't
-# done here. And the folds aren't independent trials: they share training data
-# and load is serially correlated, so a fold majority is a stability
-# signal, not four coin flips. A reversal between folds can equally mean
-# genuine regime-dependent performance rather than noise.
+# Folds share training data and load is serially correlated, so a fold majority
+# is a stability signal rather than four independent trials.
 # --------------------------------------------------------------------------
 def backtest_folds(index, first_test_start, block_months=6, val_months=12):
     """Expanding-window folds: (val_start, test_start, test_end) per fold."""
