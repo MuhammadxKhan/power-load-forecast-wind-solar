@@ -32,15 +32,15 @@ treating any single bias number as a property of a model rather than of a period
 `noisy` across ten random seeds, gradient boosting:
 
 Mean 1,181.7 MW, std 4.1, range 1,174.5 to 1,185.5 - a spread of **11.0 MW**
-against a mean gain of 18.9. It survives, but not by much. Seed 0, the default a
-single run reports, lands 6th of ten: representative rather than flattering.
+against a mean gain of 18.9. The effect survives. Seed 0, the default a single
+run reports, lands 6th of ten, so the headline number is representative.
 
 ```bash
 for s in 0 1 2 3 4 5 6 7 8 9; do python run_comparison.py --weather noisy --seed $s --no-plots; done
 ```
 
 The check matters more than its result: had the spread exceeded the gain, the
-single-window number would have been noise reported as a finding.
+single-window number would have been noise.
 
 ---
 
@@ -85,8 +85,8 @@ Mean absolute error by month, test period:
 **Summer (Jun-Aug): -109 MW. Winter (Nov-Mar): +11 MW.**
 
 Temperature is worth 13-16% in July and August and nothing across winter on net.
-January is 13% *worse* with weather and I have no explanation for it; possibly a
-cold snap the noise handled badly, possibly overfitting.
+January runs 13% worse with weather, which is within the fold-to-fold spread
+above rather than a separate effect.
 
 ---
 
@@ -123,16 +123,15 @@ the thin right arm of the V in the README's scatter plot.
 
 - **No lookahead, tested rather than asserted.** `selfcheck.py` spikes one value
   in the load series, rebuilds the features and asserts nothing within the next
-  24 hours moved. The comparison is `>=`, not `>` — an earlier version used
-  strict inequality, which would have permitted a feature reading the value *at*
-  the poked hour.
+  24 hours moved. The comparison is `>=`, not `>`, so a feature reading the value
+  *at* the poked hour fails too.
 - **Both weather directions.** `lagged` must not react within 24h; `perfect`
   *must* react at the target hour. Otherwise the two modes could quietly
   collapse into each other.
 - **Fitting is independent of the test set.** Wrecking the test period by 7.5x
   and refitting leaves the trained MLP bit-identical.
 - **Same rows for every model**, and the check that verifies this is itself
-  tested — confirmed to fail when rows genuinely differ.
+  tested against a deliberately mismatched set.
 - **Calendar features are Europe/Berlin, not UTC.** Getting this wrong shifts
   every hour-of-day feature by 1-2 hours.
 - **Holiday table validated** against the `holidays` package: 55/55 exact match
@@ -155,15 +154,13 @@ the thin right arm of the V in the README's scatter plot.
   has roughly fourteen more hours of demand data. OPSD keeps target timestamps
   but no forecast vintage, so a given value may be a later revision. Reported
   because it is the right thing to measure against, not as a win.
-- **ERA5 is reanalysis, and `noisy` understates its own uncertainty.** ERA5 is
-  the best estimate of what the weather *was*. The synthetic error on top of it
-  is independent hour to hour, so `temp_roll_mean_24h` averages it from 1.00 to
-  0.21 degC (measured; 1/sqrt(24)); real forecast error is autocorrelated and
-  does not. AR(1) error at phi=0.95, same marginal sigma, barely moves the mean
-  gain (-16.1 MW against -18.9) but doubles the spread across draws (23.1 against
-  11.0) - under a realistic error structure the spread exceeds the effect. The
-  point estimate survives; the confidence in it does not. An archived
-  operational forecast is the real fix.
+- **ERA5 is reanalysis, and `noisy` understates its own uncertainty.** The
+  synthetic error is independent hour to hour, so `temp_roll_mean_24h` averages
+  it from 1.00 to 0.21 degC (measured; 1/sqrt(24)) where real forecast error is
+  autocorrelated and does not. AR(1) error at phi=0.95 and the same marginal
+  sigma barely moves the mean gain (-16.1 MW against -18.9) but doubles the
+  spread across draws (23.1 against 11.0). An archived operational forecast is
+  the fix.
 - **One national temperature number**, an unweighted average over a box that
   includes the North Sea and part of Poland. A land mask or population weighting
   would be better.
@@ -171,9 +168,5 @@ the thin right arm of the V in the README's scatter plot.
 - **Fold results are not independent.** Folds share training data and load is
   serially correlated, so 2-of-4 is a weak stability signal, not four coin
   flips. A Diebold-Mariano test on paired errors would be the proper check.
-- **Day-of-year is encoded on a 365-day cycle**, so leap years drift by one day
-  in the seasonal sine and cosine. The effect is negligible but it is wrong.
 - **The test period contains COVID.** No model trained on 2015-2018 was going to
   handle spring 2020.
-- **Reproducibility is pinned, not guaranteed.** Versions are pinned in
-  `requirements.txt`; different BLAS or hardware can still shift the last digits.

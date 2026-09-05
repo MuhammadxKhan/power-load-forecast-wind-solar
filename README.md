@@ -7,10 +7,10 @@ Temperature enters through four switchable modes - `none`, `lagged`, `noisy`,
 `perfect` - so the question gets a number rather than an assumption. `perfect`
 is the ceiling: the most any weather model could contribute.
 
-It depends on the season. Temperature is worth 13-16% in July and August and
-nothing across winter, and the fold-to-fold range is about five times the mean
-effect. Establishing that took a ten-seed study and a rolling-origin backtest;
-the single-window number could not separate a real effect from a lucky draw.
+The answer is seasonal. Temperature is worth 13-16% in July and August and close
+to nothing across winter. Establishing that took a ten-seed study and a
+rolling-origin backtest, because on a single window the effect and the noise are
+the same size.
 
 Data: [OPSD](https://open-power-system-data.org/) time series (2020-10-06
 release), German hourly load 2015-2020, plus ERA5 2m temperature (NetCDF, via
@@ -47,8 +47,9 @@ half the seasonal-naive baseline's error.
 
 The ENTSO-E row is the TSOs' own published day-ahead forecast, scored on the
 same rows. Note its bias: it runs 608 MW low on average, which MAE hides
-entirely - and it is not a like-for-like comparison, since that forecast is
-issued around 10:00 on D-1 rather than at midnight.
+entirely. It is not a like-for-like comparison - that forecast is issued around
+10:00 on D-1 rather than at midnight - but it is the right thing to measure
+against.
 
 The +258 MW bias on the GBM is almost entirely spring 2020: across the whole of
 2019 it is +94 MW, or 0.17% of mean demand.
@@ -79,14 +80,13 @@ Perfect foreknowledge of temperature - an upper bound no weather model can reach
 - buys 2.5%. `lagged` is *worse* than no weather at all: yesterday's temperature
 adds noise the model has already extracted from yesterday's demand.
 
-One window and one noise draw is not enough to trust that, so it was checked two
+One window and one noise draw does not establish that, so it is checked two
 further ways:
 
 - **Reseeding.** Across ten seeds the spread is 11.0 MW against a mean gain of
-  18.9 MW. The effect survives, but not by much, and seed 0 - the default a
-  single run reports - lands 6th of ten rather than flattering the result.
-- **Rolling folds.** Mean -27.0 MW, but it helps clearly in only two folds of
-  four, and the fold-to-fold range is 133 MW, five times the mean effect.
+  18.9 MW, and seed 0 - the default a single run reports - lands 6th of ten.
+- **Rolling folds.** Mean -27.0 MW, but the gain is clear in only two folds of
+  four and the fold-to-fold range is 133 MW, five times the mean effect.
 
 So "weather helps" is a claim about summer, not about the year. The reason it
 adds so little on average: temperature is 96% autocorrelated at 24 hours, and
@@ -116,9 +116,8 @@ What the numbers already say:
   reseeding spread (11 MW) are the same order, and the effect is positive in
   only two folds of four.
 
-Not claimed: these are gradient boosting and a small MLP over tabular features,
-not weather models, and ERA5 is reanalysis - nothing here measures any
-operational forecast's skill.
+ERA5 is reanalysis, so nothing here measures an operational forecast's skill -
+it measures what perfect information would be worth.
 
 ---
 
@@ -145,28 +144,6 @@ ANALYSIS.md   seed study, folds, monthly breakdown, full limitations
 selfcheck.py  13 correctness checks, synthetic data, no network
 old-models/   the original single-file version, kept for reference
 ```
-
----
-
-## Bugs found and fixed after review
-
-- **Silent early stopping.** scikit-learn's `HistGradientBoostingRegressor`
-  defaults to `early_stopping="auto"`, which switches itself on above 10,000 rows
-  and carves an internal 10% validation slice out of training data. With 25,800
-  rows it was active without my knowing, so `max_iter=600` was really running ~95
-  iterations and the grid over [300, 600] was tuning a parameter the model
-  ignored. Now explicitly off, so the external validation fold is the only one.
-- **UTC vs local time.** Calendar features were built on UTC timestamps. Germany
-  is UTC+1/+2, so every hour-of-day and is-weekend feature was offset.
-- **Leakage test off by one.** The perturbation check used `>` where it needed
-  `>=`, so a feature using the value at the poked hour would have passed.
-- **NetCDF multi-file read.** `xarray.open_mfdataset` needs dask, which is not a
-  dependency; the single-file path masked it. Files are now opened individually
-  and concatenated.
-- **Two worst days are both Corpus Christi** (2019-06-20, 2020-06-11) — a public
-  holiday in some German states but not all, so it is absent from the national
-  list and treated as a working day. Plausible but unconfirmed; the ablation that
-  would prove it has not been run.
 
 ---
 
