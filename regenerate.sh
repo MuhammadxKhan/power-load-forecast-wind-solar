@@ -4,14 +4,17 @@
 set -e
 PY="C:/Users/mikah/AppData/Local/Python/pythoncore-3.14-64/python.exe"
 
+# Order matters: every run writes results/scores.csv and results/predictions.csv,
+# so the run that should end up committed there has to go last. The headline
+# table is the no-weather run, so that one goes after the two weather runs.
 echo "=== 1/5  demand, weather figures ==="
 "$PY" run_comparison.py --weather noisy
 
-echo "=== 2/5  demand, headline table (no weather) ==="
-"$PY" run_comparison.py --weather none --no-plots
-
-echo "=== 3/5  demand, rolling-origin backtest ==="
+echo "=== 2/5  demand, rolling-origin backtest ==="
 "$PY" run_comparison.py --weather noisy --backtest --no-plots
+
+echo "=== 3/5  demand, headline table (no weather) - writes scores.csv last ==="
+"$PY" run_comparison.py --weather none --no-plots
 
 echo "=== 4/5  solar ==="
 "$PY" run_comparison.py --target solar --weather clearsky
