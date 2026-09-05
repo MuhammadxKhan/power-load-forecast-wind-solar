@@ -40,6 +40,9 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--weather", default="none",
                    choices=["none", "lagged", "noisy", "perfect"])
+    p.add_argument("--weighting", default="population",
+                   choices=["box", "land", "population"],
+                   help="how the ERA5 grid is reduced to one national number")
     p.add_argument("--val-start", default="2018-01-01")
     p.add_argument("--test-start", default="2019-01-01")
     p.add_argument("--backtest", action="store_true",
@@ -59,9 +62,10 @@ def main():
 
     temp = None
     if args.weather != "none":
-        temp = load_temperature(load.index)
+        temp = load_temperature(load.index, weighting=args.weighting)
         print(f"temperature: {temp.min():.1f} to {temp.max():.1f} C, "
-              f"mean {temp.mean():.1f} C   (mode: {args.weather})")
+              f"mean {temp.mean():.1f} C   "
+              f"(mode: {args.weather}, weighting: {args.weighting})")
     print()
 
     X, y = build_features(load, temp, weather_mode=args.weather, seed=args.seed)

@@ -28,8 +28,9 @@ OPSD_URL = (f"https://data.open-power-system-data.org/time_series/{OPSD_VERSION}
 OPSD_CACHE = "opsd_60min.csv"        # the full 94MB file, gitignored
 OPSD_EXTRACT = "data/de_hourly.csv"  # three columns of it, ~2MB, committed
 
-ERA5_CACHE = "data/era5_temp_de.csv"   # derived national series, small, committable
-ERA5_GLOB = "data/era5_raw/*.nc"       # raw download, ~1GB, gitignored
+ERA5_CACHE = "data/era5_temp_de.csv"            # unweighted box mean, committed
+ERA5_WEIGHTED = "data/era5_temp_de_weighted.csv"  # box/land/population, committed
+ERA5_GLOB = "data/era5_raw/*.nc"                # raw download, ~1GB, gitignored
 
 # A rectangle loosely around Germany, not a border. It includes sea and parts of
 # four neighbours; masking it to land is the first thing worth doing.
@@ -102,28 +103,43 @@ def _fill_gaps(s):
 # --------------------------------------------------------------------------
 # weather
 # --------------------------------------------------------------------------
-def load_temperature(index=None):
+def load_temperature(index=None, weighting="population"):
     """National hourly 2m temperature in Celsius, indexed by UTC.
 
-    Reads the small derived CSV if it is there, otherwise builds it from the
-    NetCDF in era5_raw/ and writes it out so the slow path happens once.
+    Three ways of turning the grid into one number, all reduced from the same
+    files by src/geo.py:
 
-    This is the unweighted box mean, so it includes sea and parts of four
-    neighbours, and weights Berlin the same as the North Sea.
+      "box"         unweighted mean of the whole rectangle - 45% of it is sea or
+                    a neighbouring country
+      "land"        area-weighted, masked to the German outline
+      "population"  land, then weighted by where people are
+
+    Reads the committed CSV if it is there, otherwise builds all three from the
+    NetCDF in era5_raw/ and writes them out, so the slow path happens once.
     """
-    if os.path.exists(ERA5_CACHE):
+    from .geo import WEIGHTINGS
+    if weighting not in WEIGHTINGS:
+        raise ValueError(f"weighting must be one of {WEIGHTINGS}")
+
+    if os.path.exists(ERA5_WEIGHTED):
+        df = pd.read_csv(ERA5_WEIGHTED, parse_dates=["timestamp"]).set_index("timestamp")
+        df.index = pd.DatetimeIndex(df.index).tz_convert("UTC")
+        s = df[weighting]
+    elif weighting == "box" and os.path.exists(ERA5_CACHE):
         s = pd.read_csv(ERA5_CACHE, parse_dates=["timestamp"]).set_index("timestamp")["temp_c"]
         s.index = pd.DatetimeIndex(s.index).tz_convert("UTC")
     else:
-        files = sorted(glob.glob(ERA5_GLOB))
-        if not files:
+        if not sorted(glob.glob(ERA5_GLOB)):
             raise FileNotFoundError(
-                f"no {ERA5_CACHE} and nothing matching {ERA5_GLOB}.\n"
+                f"no {ERA5_WEIGHTED} and nothing matching {ERA5_GLOB}.\n"
                 "Run  python -m src.download_era5  first (free Copernicus account "
                 "needed), or run without --weather.")
-        s = _from_netcdf(files)
-        s.rename_axis("timestamp").rename("temp_c").to_csv(ERA5_CACHE)
-        print(f"Wrote {ERA5_CACHE} ({len(s):,} hours) - the raw NetCDF isn't needed again")
+        from .geo import all_weightings
+        df = all_weightings()
+        df.to_csv(ERA5_WEIGHTED)
+        print(f"Wrote {ERA5_WEIGHTED} ({len(df):,} hours) - the raw NetCDF isn't "
+              "needed again")
+        s = df[weighting]
 
     s.name = "temp_c"
     if index is not None:
