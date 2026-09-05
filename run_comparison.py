@@ -24,22 +24,31 @@ matplotlib.use("Agg")            # no display in a plain terminal
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from src.data import load_frame, load_temperature
+from src.data import ZONE_CENTROIDS, load_frame, load_solar, load_temperature
 from src.evaluate import (backtest_folds, backtest_run, backtest_summary,
-                          baseline_preds, mae, mae_by_target_hour, score_table,
-                          skill, worst_days)
-from src.features import build_features, chronological_split
+                          baseline_preds, daylight_rows, mae,
+                          mae_by_target_hour, score_table, skill,
+                          solar_baseline_preds, solar_score_table, worst_days)
+from src.features import (build_features, build_solar_features,
+                          chronological_split)
 from src.models import ALL_MODELS
+from src.solar import fleet_clear_sky
 
 RESULTS = "results"
 OUT = os.path.join(RESULTS, "figures")
 TZ = "Europe/Berlin"
 
 
+LOAD_MODES = ("none", "lagged", "noisy", "perfect")
+SOLAR_MODES = ("none", "clearsky", "lagged", "perfect")
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--weather", default="none",
-                   choices=["none", "lagged", "noisy", "perfect"])
+    p.add_argument("--target", default="load", choices=["load", "solar"])
+    p.add_argument("--weather", default=None,
+                   choices=sorted(set(LOAD_MODES) | set(SOLAR_MODES)),
+                   help=f"load: {'/'.join(LOAD_MODES)};  solar: {'/'.join(SOLAR_MODES)}")
     p.add_argument("--weighting", default="population",
                    choices=["box", "land", "population"],
                    help="how the ERA5 grid is reduced to one national number")
@@ -53,8 +62,20 @@ def main():
                         "trusting one run")
     args = p.parse_args()
 
-    os.makedirs(RESULTS, exist_ok=True)
+    allowed = SOLAR_MODES if args.target == "solar" else LOAD_MODES
+    if args.weather is None:
+        args.weather = "clearsky" if args.target == "solar" else "none"
+    if args.weather not in allowed:
+        p.error(f"--weather {args.weather} is not available for --target "
+                f"{args.target}; choose from {'/'.join(allowed)}")
 
+    os.makedirs(RESULTS, exist_ok=True)
+    if args.target == "solar":
+        return run_solar(args)
+    return run_load(args)
+
+
+def run_load(args):
     print("Loading German hourly load...")
     frame = load_frame()
     load = frame["load_mw"]
@@ -141,6 +162,80 @@ def main():
     print("Wrote results/scores.csv and results/predictions.csv")
 
 
+def run_solar(args):
+    print("Loading German hourly solar generation...")
+    df = load_solar()
+    cf, cap = df["capacity_factor"], df["capacity_mw"]
+    print(f"{len(cf):,} hours, {cf.index[0]:%Y-%m-%d} to {cf.index[-1]:%Y-%m-%d}")
+    print(f"installed capacity {cap.iloc[0] / 1000:.1f} -> {cap.iloc[-1] / 1000:.1f} GW "
+          f"({cap.iloc[-1] / cap.iloc[0] - 1:+.0%}) - which is why the target is "
+          "capacity factor, not MW")
+
+    temp = None
+    if args.weather in ("lagged", "perfect"):
+        temp = load_temperature(cf.index, weighting=args.weighting)
+        print(f"temperature: mean {temp.mean():.1f} C  (weighting: {args.weighting})")
+
+    shares = {z: float(df[f"solar_{z}_mw"].mean()) for z in ZONE_CENTROIDS}
+    total = sum(shares.values())
+    cs = fleet_clear_sky(cf.index, ZONE_CENTROIDS, shares, air_c=temp)
+    print("fleet clear sky, generation-weighted over the control zones: "
+          + ", ".join(f"{z} {s / total:.0%}" for z, s in shares.items()))
+    print()
+
+    X, y = build_solar_features(cf, None if args.weather == "none" else cs,
+                                temp, weather_mode=args.weather)
+    print(f"{X.shape[1]} features, {len(X):,} usable rows   (mode: {args.weather})\n")
+
+    (Xtr, ytr), (Xva, yva), (Xte, yte) = chronological_split(
+        X, y, args.val_start, args.test_start)
+    for nm, s in (("train", ytr), ("val", yva), ("test", yte)):
+        print(f"{nm:<6}{s.index[0]:%Y-%m-%d}..{s.index[-1]:%Y-%m-%d}  ({len(s):,}h)")
+    print()
+
+    Xfit, yfit = pd.concat([Xtr, Xva]), pd.concat([ytr, yva])
+
+    print("Tuning on validation (test untouched):")
+    preds, chosen = solar_baseline_preds(cf, cs, yte.index), []
+    for fit in ALL_MODELS:
+        fn, info = fit(Xtr, ytr, Xva, yva, Xfit, yfit, verbose=True)
+        preds[info["name"]] = fn(Xte).clip(lower=0.0)
+        chosen.append(info)
+    print("\n  chose " + ", ".join(f"{i['name']} {i['params']}" for i in chosen) + "\n")
+
+    day = daylight_rows(cs, yte.index)
+    night_share = 1.0 - len(day) / len(yte)
+    print(f"Scoring {len(day):,} daylight hours of {len(yte):,} "
+          f"({night_share:.0%} of the test period is night and is dropped).")
+
+    all_hours = solar_score_table(yte, preds, capacity=cap)
+    table = solar_score_table(yte.loc[day], {k: v.loc[day] for k, v in preds.items()},
+                              capacity=cap)
+    print("\nTest-set results, daylight hours only:\n")
+    print(table.round(4).to_string())
+
+    best = table.index[0]
+    inflate = all_hours.loc[best, "MAE_cf"]
+    print(f"\nKeeping the night in would report {inflate:.4f} instead of "
+          f"{table.loc[best, 'MAE_cf']:.4f} for {best} - a {1 - inflate / table.loc[best, 'MAE_cf']:.0%} "
+          "flattering of a number nobody forecast.")
+
+    cs_p = table.loc["clearsky_persistence", "MAE_cf"]
+    print(f"\nBest model: {best}. Against clear-sky persistence, the standard "
+          f"solar baseline:\n  {table.loc[best, 'MAE_cf']:.4f} vs {cs_p:.4f} "
+          f"({1 - table.loc[best, 'MAE_cf'] / cs_p:+.1%})")
+
+    if not args.no_plots:
+        made = solar_plots(yte.loc[day], {k: v.loc[day] for k, v in preds.items()},
+                           cs, cf)
+        print("\nWrote " + ", ".join(made))
+
+    table.to_csv(os.path.join(RESULTS, "solar_scores.csv"))
+    pd.DataFrame(preds).assign(actual=yte).to_csv(
+        os.path.join(RESULTS, "solar_predictions.csv"))
+    print("Wrote results/solar_scores.csv and results/solar_predictions.csv")
+
+
 # --------------------------------------------------------------------------
 # plots
 # --------------------------------------------------------------------------
@@ -222,6 +317,60 @@ def plot_worst_days(y, preds, n=12):
     ax.set_xlabel(f"{name} mean absolute error, GW")
     ax.grid(alpha=0.3, axis="x")
     return _save(fig, "worst_days.png")
+
+
+def plot_solar_week(y, preds, clear_sky, days=7, start=None):
+    """A week of capacity factor under its own clear-sky ceiling.
+
+    The ceiling is astronomy and costs nothing to know. The gap between it and
+    the black line is cloud, and cloud is the whole forecasting problem.
+    """
+    idx = y.index.tz_convert(TZ)
+    start = pd.Timestamp(start, tz=TZ) if start else idx[len(idx) // 2]
+    m = (idx >= start) & (idx < start + pd.Timedelta(days=days))
+
+    fig, ax = plt.subplots(figsize=(11, 4))
+    ceiling = (clear_sky["cs_poa"].reindex(y.index) / 1000.0)[m]
+    ax.fill_between(idx[m], 0, ceiling, color="orange", alpha=0.25,
+                    label="clear-sky ceiling")
+    ax.plot(idx[m], y[m], color="black", lw=2, label="actual")
+    for name in ("gbm", "mlp", "clearsky_persistence"):
+        if name in preds:
+            ax.plot(idx[m], preds[name][m], lw=1.1, alpha=0.85, label=name)
+    ax.set_ylabel("capacity factor")
+    ax.set_xlabel(f"local time, {days} days from {start:%Y-%m-%d}")
+    ax.legend(ncol=5, fontsize=8)
+    ax.grid(alpha=0.3)
+    return _save(fig, "solar_week.png")
+
+
+def plot_clearsky_vs_actual(cf, clear_sky):
+    """Capacity factor against the clear-sky ceiling, daylight hours.
+
+    Almost every point sits under the diagonal, because cloud can only subtract.
+    The upper edge is the clear-sky model, and how tightly the points hug it is
+    how much of the problem astronomy has already solved.
+    """
+    poa = clear_sky["cs_poa"].reindex(cf.index) / 1000.0
+    day = clear_sky["daylight"].reindex(cf.index).fillna(False).to_numpy()
+    month = cf.index.tz_convert(TZ).month
+
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    sc = ax.scatter(poa[day], cf[day], c=month[day], s=2, alpha=0.25, cmap="twilight")
+    lim = float(poa[day].max())
+    ax.plot([0, lim], [0, lim], color="black", lw=1.5, ls="--",
+            label="clear sky (no cloud)")
+    ax.set_xlabel("clear-sky plane-of-array, kW/m2")
+    ax.set_ylabel("capacity factor")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+    fig.colorbar(sc, ax=ax, label="month")
+    return _save(fig, "solar_clearsky_vs_actual.png")
+
+
+def solar_plots(y, preds, clear_sky, cf):
+    return [plot_solar_week(y, preds, clear_sky),
+            plot_clearsky_vs_actual(cf, clear_sky)]
 
 
 def all_plots(y, preds, temp=None):
