@@ -140,6 +140,25 @@ NOCT_RISE = (45.0 - 20.0) / 800.0   # cell temperature rise per W/m2, see solar.
 GAMMA = -0.004                      # output lost per degree above 25 C
 
 
+def solar_history_features(weather_mode="clearsky"):
+    """Every feature derived from past generation, for the given mode.
+
+    Defined here rather than listed at the call site, so that adding a feature
+    that reads the target cannot silently escape it. ablations.py drops these to
+    model an asset with no production record, and selfcheck.py verifies the list
+    is complete by poking the generation series and requiring that nothing
+    outside it moves.
+
+    kt_yesterday belongs here and is easy to miss: it looks like a weather
+    feature and is named like one, but yesterday's clear-sky index is computed
+    from yesterday's output.
+    """
+    cols = [f"lag_{lag}h" for lag in SOLAR_LAGS] + ["roll_mean_24h", "roll_mean_168h"]
+    if weather_mode in ("lagged", "perfect"):
+        cols.append("kt_yesterday")
+    return tuple(cols)
+
+
 def build_solar_features(cf, clear_sky=None, temp=None, weather_mode="clearsky"):
     """Features for the solar capacity-factor model.
 
