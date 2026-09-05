@@ -18,24 +18,37 @@ import pandas as pd
 from src.data import ZONE_CENTROIDS, load_frame, load_solar, load_temperature
 from src.evaluate import backtest_folds, backtest_run, mae
 from src.features import (build_features, build_solar_features,
-                          chronological_split)
+                          chronological_split, solar_history_features)
 from src.models import fit_gbm
 from src.solar import fleet_clear_sky
 
 VAL_START, TEST_START = "2018-01-01", "2019-01-01"
-NO_HISTORY = ("lag_24h", "lag_48h", "lag_72h", "lag_168h",
-              "roll_mean_24h", "roll_mean_168h")
 
 
 def _fit_score(X, y, mask=None):
+    """Fit and score with the same protocol run_comparison.py uses.
+
+    When a mask is given - solar, where it is the daylight hours - the model is
+    fitted and tuned on the masked rows as well as scored on them. Tuning on the
+    unmasked set would select hyperparameters on a metric half of which is night,
+    which changes which model wins.
+    """
     (Xtr, ytr), (Xva, yva), (Xte, yte) = chronological_split(X, y, VAL_START, TEST_START)
+
+    if mask is None:
+        fn, _ = fit_gbm(Xtr, ytr, Xva, yva,
+                        pd.concat([Xtr, Xva]), pd.concat([ytr, yva]), verbose=False)
+        return mae(yte, fn(Xte))
+
+    def _keep(obj):
+        m = mask.reindex(obj.index).fillna(False).to_numpy().astype(bool)
+        return obj[m]
+
+    Xtr, ytr, Xva, yva = _keep(Xtr), _keep(ytr), _keep(Xva), _keep(yva)
     fn, _ = fit_gbm(Xtr, ytr, Xva, yva,
                     pd.concat([Xtr, Xva]), pd.concat([ytr, yva]), verbose=False)
-    pred = fn(Xte)
-    if mask is None:
-        return mae(yte, pred)
-    m = mask.reindex(yte.index).fillna(False).to_numpy().astype(bool)
-    return mae(yte[m], pred[m].clip(lower=0.0))
+    Xte_d, yte_d = _keep(Xte), _keep(yte)
+    return mae(yte_d, fn(Xte_d).clip(lower=0.0))
 
 
 def demand_modes(load, weighting="population"):
@@ -65,7 +78,9 @@ def solar_modes(cf, cs, temp, daylight, drop_history=False):
     for mode in ("none", "clearsky", "lagged", "perfect"):
         X, y = build_solar_features(cf, None if mode == "none" else cs, temp, mode)
         if drop_history:
-            X = X.drop(columns=[c for c in NO_HISTORY if c in X])
+            # from features.py, so a new target-derived column cannot escape it
+            hist = solar_history_features(mode)
+            X = X.drop(columns=[c for c in hist if c in X])
         rows.append({"mode": mode, "MAE_cf": round(_fit_score(X, y, daylight), 4)})
     out = pd.DataFrame(rows).set_index("mode")
     base = out.loc["none", "MAE_cf"]

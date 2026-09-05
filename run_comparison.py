@@ -191,14 +191,26 @@ def run_solar(args):
         X, y, args.val_start, args.test_start)
     for nm, s in (("train", ytr), ("val", yva), ("test", yte)):
         print(f"{nm:<6}{s.index[0]:%Y-%m-%d}..{s.index[-1]:%Y-%m-%d}  ({len(s):,}h)")
-    print()
 
-    Xfit, yfit = pd.concat([Xtr, Xva]), pd.concat([ytr, yva])
+    # Fit and tune on daylight only. Night is ~48% of every fold and its answer
+    # is exactly zero, so leaving it in dilutes the validation MAE that picks the
+    # ridge alpha, the booster's learning rate and the MLP's epoch count. It is
+    # not cosmetic: selecting on the diluted metric makes ridge look like the
+    # best model, and selecting on daylight the MLP wins instead.
+    def _day(frame_or_series):
+        m = cs["daylight"].reindex(frame_or_series.index).fillna(False)
+        return frame_or_series[m.to_numpy().astype(bool)]
+
+    Xtr_d, ytr_d, Xva_d, yva_d = _day(Xtr), _day(ytr), _day(Xva), _day(yva)
+    Xfit_d = pd.concat([Xtr_d, Xva_d])
+    yfit_d = pd.concat([ytr_d, yva_d])
+    print(f"fitting on {len(ytr_d):,} daylight train hours of {len(ytr):,}, "
+          f"tuning on {len(yva_d):,} of {len(yva):,}\n")
 
     print("Tuning on validation (test untouched):")
     preds, chosen = solar_baseline_preds(cf, cs, yte.index), []
     for fit in ALL_MODELS:
-        fn, info = fit(Xtr, ytr, Xva, yva, Xfit, yfit, verbose=True)
+        fn, info = fit(Xtr_d, ytr_d, Xva_d, yva_d, Xfit_d, yfit_d, verbose=True)
         preds[info["name"]] = fn(Xte).clip(lower=0.0)
         chosen.append(info)
     print("\n  chose " + ", ".join(f"{i['name']} {i['params']}" for i in chosen) + "\n")
