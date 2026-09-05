@@ -13,17 +13,19 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
 
-from src.data import _from_netcdf, fake_frame, fake_temperature
+from src.data import (ZONE_CENTROIDS, _from_netcdf, fake_frame, fake_solar,
+                      fake_temperature)
+from src.evaluate import (assert_same_rows, baseline_preds, clearsky_persistence,
+                          daylight_rows, mae, mae_by_target_hour, predict,
+                          seasonal_naive, skill, solar_yesterday)
+from src.features import (build_features, build_solar_features,
+                          chronological_split, degree_hours, usable_temperature)
 from src.geo import (Grid, area_weights, grid_weights, inside_outline,
                      population_weights)
-from src.solar import (air_mass, cell_temperature, clear_sky_dni, clear_sky_ghi,
-                       clear_sky_index, is_daylight, plane_of_array,
-                       solar_position, temperature_derate)
-from src.evaluate import (assert_same_rows, baseline_preds, mae,
-                          mae_by_target_hour, predict, seasonal_naive, skill)
-from src.features import (build_features, chronological_split, degree_hours,
-                          usable_temperature)
 from src.models import ALL_MODELS, fit_mlp
+from src.solar import (air_mass, cell_temperature, clear_sky_dni, clear_sky_ghi,
+                       clear_sky_index, fleet_clear_sky, is_daylight,
+                       plane_of_array, solar_position, temperature_derate)
 
 VAL_START, TEST_START = "2016-09-01", "2016-11-01"
 
@@ -485,6 +487,105 @@ def check_daylight_mask():
     print(f"  [ok] daylight is {frac:.0%} of the year, {per_day.min()}-{per_day.max()}h a day")
 
 
+def _fake_solar_inputs(n_days=400, seed=2):
+    idx = pd.date_range("2016-01-01", periods=n_days * 24, freq="h", tz="UTC")
+    df = fake_solar(idx, seed=seed)
+    shares = {z: 1.0 for z in ZONE_CENTROIDS}
+    temp = fake_temperature(idx, seed=seed)
+    cs = fleet_clear_sky(idx, ZONE_CENTROIDS, shares, air_c=temp)
+    return df["capacity_factor"], cs, temp
+
+
+def check_solar_no_leakage():
+    """18) no solar feature reads generation newer than 24 hours.
+
+    Same poke as the demand check. The interesting half is the other direction:
+    the clear-sky columns must NOT move at all, because they are astronomy and
+    know nothing about what the fleet produced.
+    """
+    cf, cs, temp = _fake_solar_inputs()
+
+    for mode in ("none", "clearsky", "lagged", "perfect"):
+        Xb, _ = build_solar_features(cf, None if mode == "none" else cs, temp, mode)
+        poked, t = _poke(cf, 3000, 0.4)
+        Xa, _ = build_solar_features(poked, None if mode == "none" else cs, temp, mode)
+
+        changed = _changed_rows(Xb, Xa)
+        too_soon = changed[(changed >= t) & (changed < t + pd.Timedelta("24h"))]
+        assert len(too_soon) == 0, \
+            f"LEAKAGE in mode {mode!r}: reacted within 24h at {list(too_soon)[:3]}"
+        assert (changed >= t + pd.Timedelta("24h")).any(), \
+            f"mode {mode!r}: nothing reacted at all, the lags look dead"
+
+        if mode != "none":
+            sky = [c for c in ("cs_poa", "cs_ghi", "elevation", "azimuth") if c in Xb]
+            common = Xb.index.intersection(Xa.index)
+            assert (Xb.loc[common, sky] == Xa.loc[common, sky]).all().all(), \
+                f"mode {mode!r}: a clear-sky column moved when generation changed"
+    print("  [ok] no solar feature reads generation newer than 24h")
+
+
+def check_solar_modes():
+    """19) each solar mode adds what it says, and temperature timing is the only
+    difference between lagged and perfect."""
+    cf, cs, temp = _fake_solar_inputs()
+    cols = {m: set(build_solar_features(cf, None if m == "none" else cs, temp, m)[0])
+            for m in ("none", "clearsky", "lagged", "perfect")}
+
+    assert not (cols["none"] & {"cs_poa", "temp_c"}), "mode 'none' picked up weather"
+    assert {"cs_poa", "cs_ghi", "elevation", "azimuth"} <= cols["clearsky"], \
+        "mode 'clearsky' is missing solar geometry"
+    assert "temp_c" not in cols["clearsky"], "mode 'clearsky' should use no temperature"
+    assert cols["lagged"] == cols["perfect"], \
+        "lagged and perfect must differ only in when temperature is read"
+    assert {"temp_c", "cell_c", "derate", "kt_yesterday"} <= cols["lagged"]
+
+    # and they must actually differ in value, or the two modes are the same thing
+    Xl, _ = build_solar_features(cf, cs, temp, "lagged")
+    Xp, _ = build_solar_features(cf, cs, temp, "perfect")
+    common = Xl.index.intersection(Xp.index)
+    assert not np.allclose(Xl.loc[common, "temp_c"], Xp.loc[common, "temp_c"]), \
+        "lagged and perfect read the same temperature"
+
+    # perfect must react to a temperature poke at the target hour; lagged must not
+    poked, t = _poke(temp, 4000, 20.0)
+    for mode, should_react in (("lagged", False), ("perfect", True)):
+        Xb, _ = build_solar_features(cf, cs, temp, mode)
+        Xa, _ = build_solar_features(cf, fleet_clear_sky(
+            cf.index, ZONE_CENTROIDS, {z: 1.0 for z in ZONE_CENTROIDS}, air_c=poked),
+            poked, mode)
+        reacted = t in _changed_rows(Xb, Xa)
+        assert reacted == should_react, \
+            f"mode {mode!r}: reacted={reacted} at the poked hour, expected {should_react}"
+    print("  [ok] solar modes add what they claim, lagged and perfect differ only in timing")
+
+
+def check_solar_baselines():
+    """20) the solar baselines behave, and smart persistence ties with plain
+    persistence at a 24-hour horizon because the sun barely moves in a day."""
+    cf, cs, _ = _fake_solar_inputs()
+
+    assert solar_yesterday(cf).iloc[24] == cf.iloc[0], "persistence is not a 24h shift"
+
+    smart = clearsky_persistence(cf, cs)
+    day = cs["daylight"].to_numpy()
+    plain = solar_yesterday(cf)
+    both = day & smart.notna().to_numpy() & plain.notna().to_numpy()
+    gap = abs((smart[both] - cf[both]).abs().mean() - (plain[both] - cf[both]).abs().mean())
+    assert gap < 0.01, f"smart and plain persistence differ by {gap:.4f} at 24h"
+
+    poa = cs["cs_poa"]
+    drift = (poa - poa.shift(24)).abs()[day].mean() / poa[day].mean()
+    assert drift < 0.05, f"clear-sky irradiance moved {drift:.1%} in 24h, expected under 5%"
+
+    rows = daylight_rows(cs, cf.index)
+    frac = len(rows) / len(cf)
+    assert 0.40 < frac < 0.65, f"daylight_rows kept {frac:.0%} of hours"
+    assert (cs["daylight"].reindex(rows)).all(), "daylight_rows kept a night hour"
+    print(f"  [ok] smart persistence ties plain at 24h (sky moves {drift:.1%}), "
+          f"daylight keeps {frac:.0%}")
+
+
 def main():
     print("Self-check on synthetic data (numbers are meaningless)...\n")
     frame = fake_frame(400, seed=1)
@@ -507,6 +608,9 @@ def main():
     check_cell_temperature()
     check_clear_sky_index()
     check_daylight_mask()
+    check_solar_no_leakage()
+    check_solar_modes()
+    check_solar_baselines()
 
     print("\nAll checks passed.")
 
