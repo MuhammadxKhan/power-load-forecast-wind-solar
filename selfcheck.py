@@ -82,7 +82,8 @@ def check_baseline_and_skill(frame):
     # 4) seasonal naive is a 168h shift, and the skill score has the right signs
     load = frame["load_mw"]
     assert seasonal_naive(load).iloc[168] == load.iloc[0]
-    yv = pd.Series([10.0, 20.0, 30.0]); b = pd.Series([12.0, 18.0, 33.0])
+    yv = pd.Series([10.0, 20.0, 30.0])
+    b = pd.Series([12.0, 18.0, 33.0])
     assert abs(skill(yv, yv, b) - 1.0) < 1e-9 and abs(skill(yv, b, b)) < 1e-9
     print("  [ok] seasonal naive is a 168h shift, skill score behaves")
 
