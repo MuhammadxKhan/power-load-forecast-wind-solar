@@ -1,11 +1,17 @@
 """
 Getting data in. Demand from OPSD, temperature from ERA5. No features here.
 
-Two columns come out of the OPSD file: load_mw, the target, and benchmark_mw,
-OPSD's aggregation of the ENTSO-E Transparency day-ahead load forecast. Under
-Regulation 543/2013 that forecast is published at least two hours before gate
-closure, around 10:00 on D-1 for Germany, so its information cutoff is earlier
-than this model's assumed midnight.
+Two targets come out of the OPSD file.
+
+Demand: load_mw, plus benchmark_mw, OPSD's aggregation of the ENTSO-E
+Transparency day-ahead load forecast. Under Regulation 543/2013 that forecast is
+published at least two hours before gate closure, around 10:00 on D-1 for
+Germany, so its information cutoff is earlier than this model's assumed midnight.
+
+Solar: generation, installed capacity, and the four TSO control zones. The
+German fleet grew from 37 GW to 50 GW over these six years, so the modelling
+target is capacity factor rather than MW - generation in MW is not stationary
+and a model fitted on 2015 would under-predict 2020 by a third.
 
 Temperature is ERA5, ECMWF's reanalysis: their best after-the-fact estimate of
 what the weather was, hourly on a 0.25 degree grid.
@@ -38,6 +44,28 @@ BBOX = {"north": 55.0, "south": 47.0, "west": 5.5, "east": 15.5}
 
 ACTUAL_COL = "DE_load_actual_entsoe_transparency"
 BENCH_COL = "DE_load_forecast_entsoe_transparency"
+
+SOLAR_EXTRACT = "data/de_solar_hourly.csv"   # ~2MB, committed
+SOLAR_COLS = {
+    "DE_solar_generation_actual": "solar_mw",
+    "DE_solar_capacity": "capacity_mw",
+    "DE_solar_profile": "opsd_profile",       # OPSD's own capacity factor
+    "DE_50hertz_solar_generation_actual": "solar_50hertz_mw",
+    "DE_amprion_solar_generation_actual": "solar_amprion_mw",
+    "DE_tennet_solar_generation_actual": "solar_tennet_mw",
+    "DE_transnetbw_solar_generation_actual": "solar_transnetbw_mw",
+}
+
+# Approximate centroids of the four German TSO control zones. Clear-sky
+# irradiance depends on latitude, so a zone needs its own coordinates: 50Hertz
+# in the east sits about 3.4 degrees north of TransnetBW in the south-west,
+# which is roughly 25 minutes of daylight at midsummer.
+ZONE_CENTROIDS = {
+    "50hertz": (52.0, 12.5),
+    "amprion": (50.5, 7.5),
+    "tennet": (51.5, 9.8),
+    "transnetbw": (48.6, 9.0),
+}
 
 
 # --------------------------------------------------------------------------
@@ -98,6 +126,107 @@ def _fill_gaps(s):
     the data being clean.
     """
     return s.ffill().bfill()
+
+
+# --------------------------------------------------------------------------
+# solar
+# --------------------------------------------------------------------------
+def load_solar(index=None):
+    """Hourly German solar generation, capacity and capacity factor, UTC.
+
+    Columns: solar_mw, capacity_mw, capacity_factor, and one column per TSO
+    control zone.
+
+    OPSD reports installed capacity once a day, so it is forward-filled to
+    hourly. Capacity factor is generation over capacity, which is the target the
+    model actually fits: the fleet grew 36% across these six years and raw MW is
+    not comparable end to end. OPSD ships its own profile column, and
+    selfcheck.py requires the two to agree.
+    """
+    if os.path.exists(SOLAR_EXTRACT):
+        df = pd.read_csv(SOLAR_EXTRACT, parse_dates=["utc_timestamp"])
+        df = df.set_index("utc_timestamp")
+    else:
+        if not os.path.exists(OPSD_CACHE):
+            print(f"Downloading OPSD {OPSD_VERSION} (~125MB, one-off)...")
+            pd.read_csv(OPSD_URL, low_memory=False).to_csv(OPSD_CACHE, index=False)
+            print(f"Cached to {OPSD_CACHE}")
+        df = pd.read_csv(OPSD_CACHE, usecols=["utc_timestamp"] + list(SOLAR_COLS),
+                         parse_dates=["utc_timestamp"], low_memory=False)
+        df = df.set_index("utc_timestamp").rename(columns=SOLAR_COLS)
+        os.makedirs(os.path.dirname(SOLAR_EXTRACT), exist_ok=True)
+        df.to_csv(SOLAR_EXTRACT)
+        print(f"Wrote {SOLAR_EXTRACT} - commit this and nobody needs the download")
+
+    df.index = pd.DatetimeIndex(df.index).tz_convert("UTC")
+
+    s = df["solar_mw"]
+    df = df.loc[s.first_valid_index():s.last_valid_index()]
+    df = df.reindex(pd.date_range(df.index[0], df.index[-1], freq="h", tz="UTC"))
+
+    # capacity is a daily figure on an hourly index, so most hours are blank
+    df["capacity_mw"] = df["capacity_mw"].ffill().bfill()
+
+    gen_cols = [c for c in df.columns if c.endswith("_mw") and c != "capacity_mw"]
+    missing = int(df[gen_cols].isna().any(axis=1).sum())
+    if missing:
+        print(f"{missing} hours miss a solar generation figure "
+              f"({missing / len(df):.3%}) - filling from earlier values")
+        for c in gen_cols:
+            df[c] = _fill_gaps(df[c])
+
+    df["capacity_factor"] = df["solar_mw"] / df["capacity_mw"]
+
+    df.index.name = "timestamp"
+    if index is not None:
+        df = df.reindex(index)
+    return df
+
+
+def zone_capacity_factor(df, zone):
+    """A capacity factor for one control zone, from its own rolling annual peak.
+
+    OPSD publishes generation per zone but not capacity per zone, so there is no
+    published denominator. The peak generation over a trailing year is a proxy
+    for it: solar plants reach close to their rated output on the clearest days,
+    so the annual maximum tracks installed capacity and grows with it.
+
+    It is an estimate, not a measurement. Zone-level numbers are comparable with
+    each other and with their own history; they are not capacity factors in the
+    sense the national column is.
+    """
+    gen = df[f"solar_{zone}_mw"]
+    peak = gen.rolling(24 * 365, min_periods=24 * 30).max()
+    return (gen / peak.bfill()).clip(0, 1)
+
+
+def fake_solar(index, seed=0):
+    """Synthetic solar, so the checks run without the download.
+
+    Zero at night, a smooth bell through the day, seasonal amplitude, cloud as a
+    slow random wander, and capacity growing steadily. Meaningless numbers with
+    the right shape.
+    """
+    rng = np.random.default_rng(seed)
+    idx = pd.DatetimeIndex(index)
+    loc = idx.tz_convert("Europe/Berlin")
+    hour = loc.hour.to_numpy() + loc.minute.to_numpy() / 60.0
+    doy = loc.dayofyear.to_numpy()
+
+    daylight = np.clip(np.sin((hour - 6) / 12 * np.pi), 0, None)
+    season = 0.35 + 0.65 * np.clip(np.sin((doy - 80) / 365 * 2 * np.pi) * 0.5 + 0.5, 0, 1)
+    cloud = np.clip(pd.Series(rng.normal(0.75, 0.25, len(idx)))
+                    .rolling(12, min_periods=1).mean().to_numpy(), 0.05, 1.0)
+
+    capacity = np.linspace(37000, 50000, len(idx))
+    cf = np.clip(daylight * season * cloud * 0.85, 0, 1)
+    gen = cf * capacity
+
+    out = pd.DataFrame({"solar_mw": gen, "capacity_mw": capacity,
+                        "capacity_factor": cf}, index=idx)
+    for k, z in enumerate(ZONE_CENTROIDS):
+        out[f"solar_{z}_mw"] = gen * (0.15 + 0.1 * k) * (1 + rng.normal(0, 0.05, len(idx)))
+    return out.rename_axis("timestamp")
 
 
 # --------------------------------------------------------------------------
