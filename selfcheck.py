@@ -16,6 +16,9 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 from src.data import _from_netcdf, fake_frame, fake_temperature
 from src.geo import (Grid, area_weights, grid_weights, inside_outline,
                      population_weights)
+from src.solar import (air_mass, cell_temperature, clear_sky_dni, clear_sky_ghi,
+                       clear_sky_index, is_daylight, plane_of_array,
+                       solar_position, temperature_derate)
 from src.evaluate import (assert_same_rows, baseline_preds, mae,
                           mae_by_target_hour, predict, seasonal_naive, skill)
 from src.features import (build_features, chronological_split, degree_hours,
@@ -347,6 +350,141 @@ def check_bilinear():
     print("  [ok] bilinear interpolation is exact on a plane, order-independent")
 
 
+def check_solar_geometry():
+    """13) the sun is where astronomy says it is.
+
+    None of this is fitted, so it can be checked against numbers that come from
+    outside the repo: the earth's axial tilt is 23.44 degrees, the equation of
+    time runs from about -14 to +16 minutes, and noon elevation at a known
+    latitude on a solstice is 90 - latitude +/- the tilt.
+    """
+    idx = pd.date_range("2019-01-01", "2019-12-31 23:00", freq="h", tz="UTC")
+    pos = solar_position(idx, 52.52, 13.40)          # Berlin
+
+    d = pos["declination"]
+    assert abs(d.max() - 23.44) < 0.05 and abs(d.min() + 23.44) < 0.05, \
+        f"declination runs {d.min():.2f}..{d.max():.2f}, axial tilt is 23.44"
+
+    eot = pos["eot_minutes"]
+    assert -15 < eot.min() < -13 and 15 < eot.max() < 17, \
+        f"equation of time runs {eot.min():.1f}..{eot.max():.1f}, expected ~-14..+16"
+
+    for day, sign in (("2019-06-21", 1.0), ("2019-12-21", -1.0)):
+        peak = pos.loc[day, "elevation"].max()
+        want = 90.0 - 52.52 + sign * 23.44
+        assert abs(peak - want) < 0.3, \
+            f"{day} noon elevation {peak:.2f}, geometry says {want:.2f}"
+
+    # At its highest the sun bears due south from Germany. Checked at minute
+    # resolution: azimuth moves about a quarter of a degree a minute near noon,
+    # so an hourly grid misses the crossing by several degrees. This is also what
+    # tests the equation of time - drop that correction and solar noon lands up
+    # to a quarter of an hour out.
+    fine = pd.date_range("2019-06-21 09:00", "2019-06-21 13:00", freq="min", tz="UTC")
+    fine_pos = solar_position(fine, 52.52, 13.40)
+    noon = fine_pos["elevation"].idxmax()
+    assert abs(fine_pos.loc[noon, "azimuth"] - 180.0) < 0.5, \
+        f"sun bears {fine_pos.loc[noon, 'azimuth']:.2f} at solar noon, should be 180"
+
+    # Berlin is 13.4E, so solar noon runs about 54 minutes ahead of noon UTC
+    offset = (noon - pd.Timestamp("2019-06-21 12:00", tz="UTC")).total_seconds() / 60
+    assert -62 < offset < -45, f"solar noon is {offset:.0f} min from noon UTC, expected ~-54"
+
+    # and below the horizon in the middle of a December night
+    assert pos.loc["2019-12-21 01:00", "zenith"] > 90.0, "sun is up at 1am in December"
+
+    assert air_mass(0.0) < 1.001, "air mass overhead should be 1"
+    assert air_mass(60.0) > 1.9, "air mass at 60 degrees should be about 2"
+    print("  [ok] solar position matches axial tilt, equation of time, solstice noon")
+
+
+def check_clear_sky():
+    """14) the clear-sky model is internally consistent.
+
+    A panel laid flat must collect exactly the global horizontal irradiance -
+    that is the definition, and it is the check that catches an inconsistent
+    beam/diffuse split, because a beam larger than the global it belongs to
+    would force a negative diffuse term.
+    """
+    idx = pd.date_range("2019-01-01", "2019-12-31 23:00", freq="h", tz="UTC")
+    pos = solar_position(idx, 51.2, 10.4)
+    z, az = pos["zenith"].to_numpy(), pos["azimuth"].to_numpy()
+
+    ghi = clear_sky_ghi(z)
+    dni = clear_sky_dni(idx, z)
+
+    night = z >= 90.0
+    assert (ghi[night] == 0).all() and (dni[night] == 0).all(), \
+        "clear-sky irradiance is non-zero at night"
+    assert (ghi >= 0).all() and (dni >= 0).all(), "negative irradiance"
+    assert 800 < ghi.max() < 1000, f"peak clear-sky GHI {ghi.max():.0f} W/m2 is implausible"
+
+    flat = plane_of_array(ghi, dni, z, az, tilt=0.0)
+    assert np.allclose(flat, ghi), "a flat panel does not collect GHI"
+
+    # the beam's horizontal component cannot exceed the global
+    cos_z = np.cos(np.radians(np.clip(z, 0, 90)))
+    assert (dni * cos_z <= ghi + 1e-9).all(), "beam exceeds the global it is part of"
+
+    tilted = plane_of_array(ghi, dni, z, az)
+    assert (tilted >= 0).all(), "negative plane-of-array irradiance"
+    assert 1.1 < tilted.sum() / ghi.sum() < 1.4, \
+        "a 30 degree south roof should gain 10-40% over flat under clear skies"
+
+    # pointing the panel north must be worse than pointing it south
+    north = plane_of_array(ghi, dni, z, az, panel_azimuth=0.0)
+    assert north.sum() < tilted.sum(), "a north-facing roof out-collects a south-facing one"
+    print("  [ok] flat panel collects GHI exactly, beam stays inside the global")
+
+
+def check_cell_temperature():
+    """15) panels run hot, and hot panels lose output."""
+    assert abs(temperature_derate(25.0) - 1.0) < 1e-12, "derate at 25 C should be 1"
+    assert temperature_derate(45.0) < 1.0, "a hot panel should lose output"
+    assert temperature_derate(5.0) > 1.0, "a cold panel should gain"
+
+    hot = cell_temperature(25.0, 1000.0)
+    assert 50 < hot < 60, f"cell at 25 C air and full sun should be 50-60 C, got {hot:.1f}"
+    assert cell_temperature(25.0, 0.0) == 25.0, "no sun means no rise above air"
+
+    # a summer afternoon loses several percent to heat
+    loss = 1.0 - temperature_derate(cell_temperature(30.0, 900.0))
+    assert 0.05 < loss < 0.20, f"expected a 5-20% heat loss, got {loss:.1%}"
+    print(f"  [ok] cells reach {hot:.0f} C in full sun, costing {loss:.0%} at 30 C air")
+
+
+def check_clear_sky_index():
+    """16) the clear-sky index is a ratio, and undefined at night."""
+    idx = pd.date_range("2019-06-01", periods=48, freq="h", tz="UTC")
+    cs = pd.Series(np.tile(np.clip(np.sin(np.arange(24) / 24 * np.pi), 0, None) * 800, 2),
+                   index=idx)
+    gen = cs * 0.6
+
+    kt = clear_sky_index(gen, cs)
+    day = cs > 1e-3
+    assert np.allclose(kt[day], 0.6), "clear-sky index should recover the ratio"
+    assert kt[~day].isna().all(), "night hours should be NaN, not a number"
+
+    assert clear_sky_index(cs * 5, cs).max() <= 2.0, "clear-sky index should be capped"
+    print("  [ok] clear-sky index recovers the ratio and is NaN at night")
+
+
+def check_daylight_mask():
+    """17) the daylight mask drops the hours every model gets right for free."""
+    idx = pd.date_range("2019-01-01", "2019-12-31 23:00", freq="h", tz="UTC")
+    z = solar_position(idx, 51.2, 10.4)["zenith"].to_numpy()
+    day = is_daylight(z)
+
+    frac = day.mean()
+    assert 0.45 < frac < 0.60, f"{frac:.1%} of hours in daylight, expected about half"
+
+    # longest day in June, shortest in December
+    per_day = pd.Series(day, index=idx).groupby(idx.date).sum()
+    assert per_day.max() >= 16, f"longest day only {per_day.max()}h at 51N"
+    assert per_day.min() <= 9, f"shortest day still {per_day.min()}h at 51N"
+    print(f"  [ok] daylight is {frac:.0%} of the year, {per_day.min()}-{per_day.max()}h a day")
+
+
 def main():
     print("Self-check on synthetic data (numbers are meaningless)...\n")
     frame = fake_frame(400, seed=1)
@@ -364,6 +502,11 @@ def main():
     check_land_mask()
     check_weights()
     check_bilinear()
+    check_solar_geometry()
+    check_clear_sky()
+    check_cell_temperature()
+    check_clear_sky_index()
+    check_daylight_mask()
 
     print("\nAll checks passed.")
 
