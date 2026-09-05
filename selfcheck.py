@@ -14,6 +14,8 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
 
 from src.data import _from_netcdf, fake_frame, fake_temperature
+from src.geo import (Grid, area_weights, grid_weights, inside_outline,
+                     population_weights)
 from src.evaluate import (assert_same_rows, baseline_preds, mae,
                           mae_by_target_hour, predict, seasonal_naive, skill)
 from src.features import (build_features, chronological_split, degree_hours,
@@ -255,6 +257,96 @@ def check_same_rows(frame):
         raise AssertionError("assert_same_rows passed a mismatched set - it is useless")
 
 
+def check_land_mask():
+    """10) the German outline masks the right cells.
+
+    The bounding box is a rectangle over the North Sea, the Baltic and four
+    neighbours. The area the mask keeps is checkable against a number everyone
+    knows: Germany is 357,000 km2. Cell coordinates are built here rather than
+    read, so this needs no NetCDF.
+    """
+    lats = np.arange(47.0, 55.01, 0.25)
+    lons = np.arange(5.5, 15.51, 0.25)
+    mask = inside_outline(lats, lons)
+
+    # a 0.25 deg cell is 0.25*111 km tall and that times cos(lat) wide
+    km2 = (0.25 * 111.0) ** 2 * np.cos(np.deg2rad(lats))[:, None]
+    area = float((km2 * mask).sum())
+    assert 0.90 < area / 357_000 < 1.10, \
+        f"masked area {area:,.0f} km2 is not within 10% of Germany's 357,000"
+
+    assert not mask[np.argmin(abs(lats - 54.5)), np.argmin(abs(lons - 6.5))], \
+        "a North Sea cell is inside the mask"
+    assert not mask[np.argmin(abs(lats - 52.5)), np.argmin(abs(lons - 15.25))], \
+        "a cell well into Poland is inside the mask"
+    assert mask[np.argmin(abs(lats - 52.5)), np.argmin(abs(lons - 13.5))], \
+        "Berlin is outside the mask"
+    assert mask[np.argmin(abs(lats - 48.25)), np.argmin(abs(lons - 11.5))], \
+        "Munich is outside the mask"
+    print(f"  [ok] land mask keeps {mask.sum()} cells, {area:,.0f} km2 against 357,000")
+
+
+def check_weights():
+    """11) every weighting is a mean, and population weighting moves west."""
+    lats = np.arange(47.0, 55.01, 0.25)
+    lons = np.arange(5.5, 15.51, 0.25)
+
+    times = pd.date_range("2016-01-01", periods=5, freq="h", tz="UTC")
+    flat = np.full((len(times), len(lats), len(lons)), 7.5)
+    g = Grid(times, lats, lons, flat)
+
+    for kind in ("box", "land", "population"):
+        w = grid_weights(lats, lons, kind)
+        assert (w >= 0).all(), f"{kind} produced a negative weight"
+        got = g.reduce(w)
+        assert np.allclose(got.to_numpy(), 7.5), \
+            f"{kind} does not average a constant field back to the constant"
+
+    # cos(lat) must fall from south to north
+    a = area_weights(lats, lons)
+    assert a[0, 0] > a[-1, 0], "area weight should shrink towards the pole"
+
+    pop = population_weights(lats, lons)
+    nrw = pop[np.argmin(abs(lats - 51.5)), np.argmin(abs(lons - 7.5))]
+    mv = pop[np.argmin(abs(lats - 53.8)), np.argmin(abs(lons - 12.5))]
+    assert nrw > 3 * mv, \
+        f"North Rhine-Westphalia ({nrw:.2f}) should far outweigh Mecklenburg ({mv:.2f})"
+    print("  [ok] all three weightings average a constant field, population leans west")
+
+
+def check_bilinear():
+    """12) series_at is bilinear: exact on nodes, linear between them."""
+    lats = np.array([50.0, 50.25, 50.5])
+    lons = np.array([9.0, 9.25, 9.5])
+    times = pd.date_range("2016-01-01", periods=3, freq="h", tz="UTC")
+
+    # a plane in lat and lon; bilinear interpolation reproduces a plane exactly
+    lon_g, lat_g = np.meshgrid(lons, lats)
+    plane = 2.0 * lat_g + 3.0 * lon_g
+    vals = np.stack([plane + t for t in range(len(times))])
+    g = Grid(times, lats, lons, vals)
+
+    assert np.allclose(g.at(50.25, 9.25).to_numpy(), vals[:, 1, 1]), "not exact at a node"
+
+    got = g.at(50.1, 9.4).to_numpy()
+    want = 2.0 * 50.1 + 3.0 * 9.4 + np.arange(len(times))
+    assert np.allclose(got, want), f"plane not reproduced: {got} vs {want}"
+
+    # a descending-latitude file must give the same answer as an ascending one
+    flipped = Grid(times, lats[::-1], lons, vals[:, ::-1, :])
+    assert np.allclose(flipped.at(50.1, 9.4).to_numpy(), want), \
+        "latitude order changes the answer"
+
+    for bad in ((49.0, 9.25), (50.25, 12.0)):
+        try:
+            g.at(*bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"at{bad} is outside the grid and should refuse")
+    print("  [ok] bilinear interpolation is exact on a plane, order-independent")
+
+
 def main():
     print("Self-check on synthetic data (numbers are meaningless)...\n")
     frame = fake_frame(400, seed=1)
@@ -269,6 +361,9 @@ def main():
     check_netcdf_reader()
     check_mlp_scalers_and_determinism(load)
     check_same_rows(frame)
+    check_land_mask()
+    check_weights()
+    check_bilinear()
 
     print("\nAll checks passed.")
 
