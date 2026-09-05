@@ -16,7 +16,7 @@ this is how they are regenerated.
 import pandas as pd
 
 from src.data import ZONE_CENTROIDS, load_frame, load_solar, load_temperature
-from src.evaluate import mae
+from src.evaluate import backtest_folds, backtest_run, mae
 from src.features import (build_features, build_solar_features,
                           chronological_split)
 from src.models import fit_gbm
@@ -73,6 +73,67 @@ def solar_modes(cf, cs, temp, daylight, drop_history=False):
     return out
 
 
+def fold_weather_delta(load, weighting="population"):
+    """The weather gain across rolling-origin folds, gradient boosting only.
+
+    A single test window gives one number and no way to tell a real effect from
+    the window. Folds share training data and demand is serially correlated, so a
+    majority across them is a stability signal rather than four independent
+    trials - but a sign that flips between folds is worth knowing about.
+    """
+    out, starts = {}, None
+    for mode in ("none", "noisy"):
+        temp = None if mode == "none" else load_temperature(load.index, weighting=weighting)
+        X, y = build_features(load, temp, weather_mode=mode, seed=0)
+        folds = backtest_folds(X.index, TEST_START, block_months=6)
+        tidy = backtest_run(X, y, [fit_gbm], folds, verbose=False).set_index("fold")
+        out[mode] = tidy["MAE_MW"]
+        if starts is None:
+            starts = tidy["test_start"]
+        elif not starts.equals(tidy["test_start"]):
+            raise AssertionError("folds differ between modes - not comparable")
+
+    tbl = pd.DataFrame(out).round(1)
+    tbl.insert(0, "test_start", starts)
+    tbl["delta"] = (tbl["noisy"] - tbl["none"]).round(1)
+    return tbl
+
+
+def seed_study(load, n=10, weighting="population"):
+    """`noisy` across n draws of the synthetic error.
+
+    One draw is one realisation, not an uncertainty estimate. If the spread
+    across seeds is the size of the effect, the single-run number was noise.
+    """
+    temp = load_temperature(load.index, weighting=weighting)
+    scores = []
+    for seed in range(n):
+        X, y = build_features(load, temp, weather_mode="noisy", seed=seed)
+        scores.append(round(_fit_score(X, y), 1))
+    s = pd.Series(scores, index=range(n), name="MAE_MW")
+    s.index.name = "seed"
+    return s
+
+
+def monthly_breakdown(load, weighting="population"):
+    """Demand MAE by calendar month, with and without weather."""
+    out = {}
+    for mode in ("none", "noisy"):
+        temp = None if mode == "none" else load_temperature(load.index, weighting=weighting)
+        X, y = build_features(load, temp, weather_mode=mode, seed=0)
+        (Xtr, ytr), (Xva, yva), (Xte, yte) = chronological_split(
+            X, y, VAL_START, TEST_START)
+        fn, _ = fit_gbm(Xtr, ytr, Xva, yva,
+                        pd.concat([Xtr, Xva]), pd.concat([ytr, yva]), verbose=False)
+        err = (fn(Xte) - yte).abs()
+        out[mode] = err.groupby(yte.index.tz_convert("Europe/Berlin").month).mean()
+
+    tbl = pd.DataFrame(out)
+    tbl["delta_%"] = ((tbl["noisy"] - tbl["none"]) / tbl["none"] * 100).round(1)
+    tbl.index.name = "month"
+    return tbl.round(0)
+
+
 def main():
     pd.set_option("display.width", 100)
 
@@ -102,6 +163,22 @@ def main():
     drift = (poa - poa.shift(24)).abs()[daylight].mean() / poa[daylight].mean()
     print(f"\nclear-sky irradiance drift over 24h: {drift:.2%} of the daylight mean")
     print(f"daylight hours: {daylight.mean():.1%} of the year")
+
+    print("\n== demand: the weather gain across rolling folds ==")
+    ft = fold_weather_delta(load)
+    print(ft.to_string())
+    print(f"mean {ft['delta'].mean():.1f} MW, "
+          f"helps in {(ft['delta'] < 0).sum()} of {len(ft)} folds, "
+          f"fold-to-fold range {ft['delta'].max() - ft['delta'].min():.1f}")
+
+    print("\n== demand: does the weather gain survive reseeding? ==")
+    s = seed_study(load)
+    print(s.to_string())
+    print(f"mean {s.mean():.1f}, std {s.std():.1f}, "
+          f"range {s.min():.1f} to {s.max():.1f} (spread {s.max() - s.min():.1f})")
+
+    print("\n== demand: the effect by month ==")
+    print(monthly_breakdown(load).to_string())
 
 
 if __name__ == "__main__":

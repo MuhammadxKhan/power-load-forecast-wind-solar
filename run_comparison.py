@@ -226,8 +226,8 @@ def run_solar(args):
           f"({1 - table.loc[best, 'MAE_cf'] / cs_p:+.1%})")
 
     if not args.no_plots:
-        made = solar_plots(yte.loc[day], {k: v.loc[day] for k, v in preds.items()},
-                           cs, cf)
+        # every hour for the plots, not just the scored ones - see plot_solar_week
+        made = [p for p in solar_plots(yte, preds, cs, cf) if p]
         print("\nWrote " + ", ".join(made))
 
     table.to_csv(os.path.join(RESULTS, "solar_scores.csv"))
@@ -322,19 +322,33 @@ def plot_worst_days(y, preds, n=12):
 def plot_solar_week(y, preds, clear_sky, days=7, start=None):
     """A week of capacity factor under its own clear-sky ceiling.
 
-    The ceiling is astronomy and costs nothing to know. The gap between it and
-    the black line is cloud, and cloud is the whole forecasting problem.
+    The ceiling is plane-of-array irradiance as a fraction of standard test
+    conditions, so it is an upper bound on capacity factor rather than a tight
+    one: a real fleet reaches roughly half of it on a clear day, because the
+    installed base is a mixture of orientations and loses more to inverters,
+    soiling and heat. The day-to-day variation under it is cloud.
+
+    Plotted over every hour, not the daylight rows the scoring uses: dropping
+    the night and then drawing a line joins dusk straight to dawn and fills the
+    gap with a shape that never happened.
     """
     idx = y.index.tz_convert(TZ)
-    start = pd.Timestamp(start, tz=TZ) if start else idx[len(idx) // 2]
+    if start is None:
+        # midsummer, when there is something to see. November is mostly cloud.
+        june = idx[(idx.month == 6) & (idx.day >= 10)]
+        start = june[0].normalize() if len(june) else idx[len(idx) // 2]
+    else:
+        start = pd.Timestamp(start, tz=TZ)
     m = (idx >= start) & (idx < start + pd.Timedelta(days=days))
+    if m.sum() < 24:
+        return None
 
     fig, ax = plt.subplots(figsize=(11, 4))
     ceiling = (clear_sky["cs_poa"].reindex(y.index) / 1000.0)[m]
-    ax.fill_between(idx[m], 0, ceiling, color="orange", alpha=0.25,
+    ax.fill_between(idx[m], 0, ceiling, color="orange", alpha=0.3,
                     label="clear-sky ceiling")
     ax.plot(idx[m], y[m], color="black", lw=2, label="actual")
-    for name in ("gbm", "mlp", "clearsky_persistence"):
+    for name in ("ridge", "gbm", "clearsky_persistence"):
         if name in preds:
             ax.plot(idx[m], preds[name][m], lw=1.1, alpha=0.85, label=name)
     ax.set_ylabel("capacity factor")
