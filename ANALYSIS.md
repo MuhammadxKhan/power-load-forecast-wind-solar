@@ -159,42 +159,67 @@ Capacity factor, daylight hours, gradient boosting.
 
 | mode | MAE (cf) | vs `none` |
 |---|---:|---:|
-| `none` | 0.0438 | — |
-| `clearsky` | 0.0436 | −0.5% |
-| `lagged` | 0.0435 | −0.7% |
-| `perfect` | 0.0424 | **−3.2%** |
+| `none` | 0.0446 | — |
+| `clearsky` | 0.0448 | +0.4% |
+| `lagged` | 0.0442 | −0.9% |
+| `perfect` | 0.0426 | **−4.5%** |
 
-**Without it** — the same table with every lag and rolling feature dropped, which
-is the position of an asset that has no production record:
+**Without it** — the same table with every column named by
+`solar_history_features()` dropped, which is the position of an asset that has no
+production record:
 
 | mode | MAE (cf) | vs `none` |
 |---|---:|---:|
-| `none` | 0.0545 | — |
-| `clearsky` | 0.0539 | −1.1% |
-| `lagged` | 0.0483 | **−11.4%** |
-| `perfect` | 0.0443 | **−18.7%** |
+| `none` | 0.0547 | — |
+| `clearsky` | 0.0540 | −1.3% |
+| `lagged` | 0.0534 | −2.4% |
+| `perfect` | 0.0465 | **−15.0%** |
 
-Two things fall out of the pair.
+Three things fall out of the pair.
 
 **Explicit clear-sky physics is worth about 1%, either way.** That is not because
-the geometry does not matter — it is most of the signal — but because a
-gradient booster given hour-of-day and day-of-year re-derives it from three
-years of data. The physics is a reparameterisation of the calendar, not new
-information. It would stop being so the moment the model had to generalise to a
-latitude it had never seen, which is exactly the asset-yield problem.
+the geometry does not matter — it is most of the signal — but because a gradient
+booster given hour-of-day and day-of-year re-derives it from three years of data.
+The physics is a reparameterisation of the calendar, not new information. It
+would stop being so the moment the model had to generalise to a latitude it had
+never seen, which is exactly the asset-yield problem.
 
-**Weather is worth six times more without history than with it**: 18.7% against
-3.2%. Every channel that is genuinely exogenous — cloud, temperature — pays far
-better when there is no lagged observation quietly carrying it.
+**Weather is worth three times more without history than with it**: 15.0%
+against 4.5%. Every channel that is genuinely exogenous pays far better when
+there is no lagged observation quietly carrying it.
+
+**Almost all of that is temperature, not cloud persistence.** `lagged` adds
+yesterday's cloudiness and gains 2.4%; `perfect` adds target-hour temperature and
+gains 15.0%. An earlier version of this table reported `lagged` at −11.4%, which
+was wrong: `kt_yesterday` is computed from yesterday's output, so it is history
+wearing a weather name, and it was not being dropped with the other history
+columns. `solar_history_features()` now names it, and `selfcheck.py` pokes the
+generation series and requires that every column which reacts is on that list.
+
+It is worth asking whether target-hour temperature is really acting as a
+temperature, or as a proxy for a clear sky. Measured, it is not a proxy: over
+daylight hours the correlation between temperature and the clear-sky index is
+−0.010, and −0.191 within calendar month. Warm hours in Germany are, if anything,
+marginally cloudier. The derate channel is meanwhile large enough on its own —
+the modelled efficiency factor runs from 0.835 to 1.138 across daylight hours,
+a spread of about 30% — so a 15% gain in MAE does not need a hidden cloud
+signal to explain it.
 
 ---
 
 ## Solar: why night is dropped
 
-Solar output is exactly zero for 47% of the test period, and every model predicts
-those hours correctly. Scored over all hours the best model reports **0.0240**
-instead of **0.0425** — a 44% improvement delivered entirely by the planet
-rotating.
+Solar output is exactly zero for 43% of hours and the daylight mask drops 48%;
+the difference is twilight, where the fleet still reports a few tens of MW
+against a mean of 4.5 GW. Every model predicts those hours correctly. Scored over
+all hours the best model reports **0.0227** instead of **0.0419** — a 46%
+improvement delivered entirely by the planet rotating.
+
+The mask is applied before fitting, not only before scoring. Night is about half
+of every fold, so leaving it in the validation set dilutes the metric that
+selects hyperparameters. It changes the answer: tuned on all hours ridge wins at
+0.0425 and the order is ridge, booster, MLP; tuned on daylight the MLP wins at
+0.0419 and the booster drops below plain persistence.
 
 Clear-sky persistence — yesterday's cloudiness on today's sky — ties plain
 persistence at 0.0444. The reason is measurable: over 24 hours the clear-sky
@@ -227,7 +252,7 @@ treating any single bias number as a property of a model rather than of a period
 
 ## What was checked
 
-`python selfcheck.py` — 24 assertions, synthetic data, no network, run in CI on
+`python selfcheck.py` — 26 assertions, synthetic data, no network, run in CI on
 every push.
 
 - **No lookahead, tested rather than asserted.** One value in the load series is
