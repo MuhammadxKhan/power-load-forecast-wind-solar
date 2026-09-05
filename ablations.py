@@ -1,0 +1,108 @@
+"""
+The ablation tables in ANALYSIS.md, in one pass.
+
+Three questions, all answered with gradient boosting on the same split so the
+rows are comparable:
+
+  1. what each weather mode is worth, for demand and for solar
+  2. what reducing the ERA5 grid properly is worth
+  3. what the clear-sky physics is worth when there is no generation history -
+     which is the situation a new asset is in
+
+Prints tables. Nothing here is committed; the numbers go into ANALYSIS.md and
+this is how they are regenerated.
+"""
+
+import pandas as pd
+
+from src.data import ZONE_CENTROIDS, load_frame, load_solar, load_temperature
+from src.evaluate import mae
+from src.features import (build_features, build_solar_features,
+                          chronological_split)
+from src.models import fit_gbm
+from src.solar import fleet_clear_sky
+
+VAL_START, TEST_START = "2018-01-01", "2019-01-01"
+NO_HISTORY = ("lag_24h", "lag_48h", "lag_72h", "lag_168h",
+              "roll_mean_24h", "roll_mean_168h")
+
+
+def _fit_score(X, y, mask=None):
+    (Xtr, ytr), (Xva, yva), (Xte, yte) = chronological_split(X, y, VAL_START, TEST_START)
+    fn, _ = fit_gbm(Xtr, ytr, Xva, yva,
+                    pd.concat([Xtr, Xva]), pd.concat([ytr, yva]), verbose=False)
+    pred = fn(Xte)
+    if mask is None:
+        return mae(yte, pred)
+    m = mask.reindex(yte.index).fillna(False).to_numpy().astype(bool)
+    return mae(yte[m], pred[m].clip(lower=0.0))
+
+
+def demand_modes(load, weighting="population"):
+    rows = []
+    for mode in ("none", "lagged", "noisy", "perfect"):
+        temp = None if mode == "none" else load_temperature(load.index, weighting=weighting)
+        X, y = build_features(load, temp, weather_mode=mode, seed=0)
+        rows.append({"mode": mode, "MAE_MW": round(_fit_score(X, y), 1)})
+    out = pd.DataFrame(rows).set_index("mode")
+    out["vs none"] = (out["MAE_MW"] - out.loc["none", "MAE_MW"]).round(1)
+    return out
+
+
+def weighting_ablation(load):
+    rows = []
+    for w in ("box", "land", "population"):
+        temp = load_temperature(load.index, weighting=w)
+        X, y = build_features(load, temp, weather_mode="perfect")
+        rows.append({"weighting": w, "MAE_MW": round(_fit_score(X, y), 1)})
+    out = pd.DataFrame(rows).set_index("weighting")
+    out["vs box"] = (out["MAE_MW"] - out.loc["box", "MAE_MW"]).round(1)
+    return out
+
+
+def solar_modes(cf, cs, temp, daylight, drop_history=False):
+    rows = []
+    for mode in ("none", "clearsky", "lagged", "perfect"):
+        X, y = build_solar_features(cf, None if mode == "none" else cs, temp, mode)
+        if drop_history:
+            X = X.drop(columns=[c for c in NO_HISTORY if c in X])
+        rows.append({"mode": mode, "MAE_cf": round(_fit_score(X, y, daylight), 4)})
+    out = pd.DataFrame(rows).set_index("mode")
+    base = out.loc["none", "MAE_cf"]
+    out["vs none"] = ((out["MAE_cf"] - base) / base * 100).round(1)
+    return out
+
+
+def main():
+    pd.set_option("display.width", 100)
+
+    frame = load_frame()
+    load = frame["load_mw"]
+
+    print("\n== demand: what each weather mode is worth ==")
+    print(demand_modes(load).to_string())
+
+    print("\n== demand: what reducing the grid properly is worth (mode=perfect) ==")
+    print(weighting_ablation(load).to_string())
+
+    df = load_solar()
+    cf = df["capacity_factor"]
+    shares = {z: float(df[f"solar_{z}_mw"].mean()) for z in ZONE_CENTROIDS}
+    temp = load_temperature(cf.index, weighting="population")
+    cs = fleet_clear_sky(cf.index, ZONE_CENTROIDS, shares, air_c=temp)
+    daylight = cs["daylight"]
+
+    print("\n== solar: what each mode is worth, with generation history ==")
+    print(solar_modes(cf, cs, temp, daylight).to_string())
+
+    print("\n== solar: the same, with no generation history ==")
+    print(solar_modes(cf, cs, temp, daylight, drop_history=True).to_string())
+
+    poa = cs["cs_poa"]
+    drift = (poa - poa.shift(24)).abs()[daylight].mean() / poa[daylight].mean()
+    print(f"\nclear-sky irradiance drift over 24h: {drift:.2%} of the daylight mean")
+    print(f"daylight hours: {daylight.mean():.1%} of the year")
+
+
+if __name__ == "__main__":
+    main()

@@ -15,3 +15,6 @@ __pycache__/
 *.pyc
 .venv/
 .cdsapirc
+
+# regeneration log from regenerate.sh
+regen.log
