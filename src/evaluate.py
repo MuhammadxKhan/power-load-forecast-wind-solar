@@ -109,6 +109,85 @@ def score_table(y, preds, base="seasonal_naive"):
     return pd.DataFrame(rows).T.sort_values("MAE_MW")
 
 
+# --------------------------------------------------------------------------
+# solar
+#
+# Solar needs its own baselines and its own scoring rows, for two reasons.
+#
+# Half the hours in the year are night, and generation is then exactly zero.
+# Every model predicts them perfectly, so leaving them in halves every error and
+# doubles every skill score without anything having been forecast. Scoring runs
+# on daylight hours only.
+#
+# And persistence is the wrong baseline on its own. The standard one in solar
+# forecasting is clear-sky persistence: keep yesterday's cloudiness, but apply it
+# to today's sky. That separates "the sun moved" - which is known exactly - from
+# "the cloud changed", which is the only part anyone has to forecast.
+# --------------------------------------------------------------------------
+def solar_yesterday(cf):
+    """Same hour yesterday. The naive one."""
+    return cf.shift(24)
+
+
+def clearsky_persistence(cf, clear_sky):
+    """Yesterday's cloudiness on today's sky - "smart" persistence.
+
+    The standard solar baseline. Carry the clear-sky index from the same hour
+    yesterday and apply it to today's clear-sky irradiance, so the part that is
+    known exactly - where the sun is - is not being guessed from yesterday.
+
+    At a 24-hour horizon it lands almost exactly on plain persistence, because
+    the clear-sky irradiance at a given hour moves by well under one percent from
+    one day to the next. It earns its keep at longer horizons and across season
+    changes, not here. Kept in the table because it is the benchmark the solar
+    literature reports, and because the tie is the informative part.
+    """
+    poa = clear_sky["cs_poa"].reindex(cf.index)
+    kt = (cf / poa.where(poa > 1.0)).clip(upper=2.0)
+    return (kt.shift(24) * poa).clip(lower=0.0).fillna(cf.shift(24))
+
+
+def solar_baseline_preds(cf, clear_sky, index):
+    """The solar baselines, cut to the scored rows."""
+    out = {
+        "yesterday": solar_yesterday(cf).reindex(index),
+        "last_week": cf.shift(168).reindex(index),
+        "clearsky_persistence": clearsky_persistence(cf, clear_sky).reindex(index),
+    }
+    for name, pr in out.items():
+        if pr.isna().any():
+            out[name] = pr.ffill().bfill()
+    return out
+
+
+def daylight_rows(clear_sky, index):
+    """The subset of `index` where the sun is up somewhere in the fleet."""
+    day = clear_sky["daylight"].reindex(index).fillna(False).astype(bool)
+    return index[day.to_numpy()]
+
+
+def solar_score_table(y, preds, capacity=None, base="yesterday"):
+    """Scores in capacity-factor units, plus RMSE as a percentage of capacity.
+
+    MAPE is dropped rather than reported: the capacity factor passes through zero
+    twice a day, so a percentage error is unbounded at dawn and dusk and the mean
+    of it says nothing. Normalised RMSE - RMSE over rated capacity - is what the
+    solar literature reports instead.
+    """
+    assert_same_rows(y, preds)
+    b = preds[base]
+    rows = {}
+    for n, pr in preds.items():
+        row = {"MAE_cf": mae(y, pr), "RMSE_cf": rmse(y, pr),
+               "nRMSE_%": rmse(y, pr) * 100.0,
+               "bias_cf": bias(y, pr), "skill_vs_naive": skill(y, pr, b)}
+        if capacity is not None:
+            cap = float(pd.Series(capacity).reindex(y.index).mean())
+            row["MAE_MW"] = mae(y, pr) * cap
+        rows[n] = row
+    return pd.DataFrame(rows).T.sort_values("MAE_cf")
+
+
 def mae_by_target_hour(y, preds):
     """Error against the target's local clock hour.
 

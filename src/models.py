@@ -39,7 +39,7 @@ def fit_ridge(Xtr, ytr, Xva, yva, Xfit, yfit, verbose=True):
         m = make_pipeline(StandardScaler(), Ridge(alpha=a)).fit(Xtr, ytr)
         v = mae(yva, predict(m, Xva))
         if verbose:
-            print(f"  ridge alpha={a:>6}  val MAE {v:8.1f}")
+            print(f"  ridge alpha={a:>6}  val MAE {v:>10.5g}")
         if v < best_score:
             best, best_score = a, v
 
@@ -72,7 +72,7 @@ def fit_gbm(Xtr, ytr, Xva, yva, Xfit, yfit, verbose=True):
             m = _make(lr, it).fit(Xtr, ytr)
             v = mae(yva, predict(m, Xva))
             if verbose:
-                print(f"  gbm lr={lr} iters={it:>4}  val MAE {v:8.1f}")
+                print(f"  gbm lr={lr} iters={it:>4}  val MAE {v:>10.5g}")
             if v < best_score:
                 best, best_score = (lr, it), v
 
@@ -182,7 +182,7 @@ def fit_mlp(Xtr, ytr, Xva, yva, Xfit, yfit, verbose=True):
             _, _, _, ep, v = _train(Xtr, ytr, hidden, lr, MAX_EPOCHS, Xva, yva)
             if verbose:
                 print(f"  mlp hidden={str(hidden):>10} lr={lr:<6} "
-                      f"epochs={ep:>3}  val MAE {v:8.1f}")
+                      f"epochs={ep:>3}  val MAE {v:>10.5g}")
             if v < best_score:
                 best, best_score, best_epochs = (hidden, lr), v, ep
 
